@@ -19,6 +19,13 @@ except ImportError:
         def __init__(self, **config):
             pass
 
+class BaseModel(BaseModel):
+    @classmethod
+    def model_construct(cls, **data):
+        if hasattr(super(), "model_construct"):
+            return super().model_construct(**data)
+        return cls.construct(**data)
+
 class ChatCompletionChunk(BaseModel):
     id: str
     object: str

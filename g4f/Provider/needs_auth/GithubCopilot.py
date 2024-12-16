@@ -16,10 +16,12 @@ class Conversation(BaseConversation):
         self.conversation_id = conversation_id
 
 class GithubCopilot(AsyncGeneratorProvider, ProviderModelMixin):
-    url = "https://copilot.microsoft.com"
+    url = "https://github.com/copilot"
+    
     working = True
     needs_auth = True
     supports_stream = True
+    
     default_model = "gpt-4o"
     models = [default_model, "o1-mini", "o1-preview", "claude-3.5-sonnet"]
 
@@ -60,7 +62,6 @@ class GithubCopilot(AsyncGeneratorProvider, ProviderModelMixin):
             if conversation is not None:
                 conversation_id = conversation.conversation_id
             if conversation_id is None:
-                print(headers)
                 async with session.post("https://api.individual.githubcopilot.com/github/chat/threads", headers=headers) as response:
                     await raise_for_status(response)
                     conversation_id = (await response.json()).get("thread_id")

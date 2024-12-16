@@ -55,6 +55,12 @@ class Backend_Api(Api):
                 return jsonify(response)
             return response
 
+        def jsonify_providers(**kwargs):
+            response = self.get_providers(**kwargs)
+            if isinstance(response, list):
+                return jsonify(response)
+            return response
+
         self.routes = {
             '/backend-api/v2/models': {
                 'function': jsonify_models,
@@ -65,7 +71,7 @@ class Backend_Api(Api):
                 'methods': ['GET']
             },
             '/backend-api/v2/providers': {
-                'function': self.get_providers,
+                'function': jsonify_providers,
                 'methods': ['GET']
             },
             '/backend-api/v2/version': {
@@ -111,11 +117,12 @@ class Backend_Api(Api):
         """
         
         kwargs = {}
-        if "file" in request.files:
-            file = request.files['file']
-            if file.filename != '' and is_allowed_extension(file.filename):
-                kwargs['image'] = to_image(file.stream, file.filename.endswith('.svg'))
-                kwargs['image_name'] = file.filename
+        if "files[]" in request.files:
+            images = []
+            for file in request.files.getlist('files[]'):
+                if file.filename != '' and is_allowed_extension(file.filename):
+                    images.append((to_image(file.stream, file.filename.endswith('.svg')), file.filename))
+            kwargs['images'] = images
         if "json" in request.form:
             json_data = json.loads(request.form['json'])
         else:
@@ -153,7 +160,7 @@ class Backend_Api(Api):
         return response
 
     def get_provider_models(self, provider: str):
-        api_key = None if request.authorization is None else request.authorization.token
+        api_key = request.headers.get("x_api_key")
         models = super().get_provider_models(provider, api_key)
         if models is None:
             return "Provider not found", 404

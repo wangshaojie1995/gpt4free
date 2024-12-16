@@ -6,14 +6,14 @@ import time
 import random
 import re
 import json
-from ..typing import AsyncResult, Messages
-from .base_provider import AsyncGeneratorProvider, ProviderModelMixin
-from .helper import format_prompt
+from ...typing import AsyncResult, Messages
+from ..base_provider import AsyncGeneratorProvider, ProviderModelMixin
+from ..helper import format_prompt
 
 class MagickPen(AsyncGeneratorProvider, ProviderModelMixin):
     url = "https://magickpen.com"
     api_endpoint = "https://api.magickpen.com/ask"
-    working = True
+    working = False
     supports_stream = True
     supports_system_message = True
     supports_message_history = True

@@ -23,7 +23,7 @@ from starlette.status import (
     HTTP_500_INTERNAL_SERVER_ERROR,
 )
 from fastapi.encoders import jsonable_encoder
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials, HTTPBasic
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.responses import FileResponse
 from pydantic import BaseModel, Field
@@ -39,7 +39,7 @@ import g4f.debug
 from g4f.client import AsyncClient, ChatCompletion, ImagesResponse, convert_to_provider
 from g4f.providers.response import BaseConversation
 from g4f.client.helper import filter_none
-from g4f.image import is_accepted_format, images_dir
+from g4f.image import is_accepted_format, is_data_uri_an_image, images_dir
 from g4f.typing import Messages
 from g4f.errors import ProviderNotFoundError, ModelNotFoundError, MissingAuthError
 from g4f.cookies import read_cookie_files, get_cookies_dir
@@ -48,7 +48,9 @@ from g4f.gui import get_gui_app
 
 logger = logging.getLogger(__name__)
 
-def create_app(g4f_api_key: str = None):
+DEFAULT_PORT = 1337
+
+def create_app():
     app = FastAPI()
 
     # Add CORS middleware
@@ -60,7 +62,7 @@ def create_app(g4f_api_key: str = None):
         allow_headers=["*"],
     )
 
-    api = Api(app, g4f_api_key=g4f_api_key)
+    api = Api(app)
 
     if AppConfig.gui:
         @app.get("/")
@@ -82,30 +84,46 @@ def create_app(g4f_api_key: str = None):
     if not AppConfig.ignore_cookie_files:
         read_cookie_files()
 
+    if AppConfig.ignored_providers:
+        for provider in AppConfig.ignored_providers:
+            if provider in ProviderUtils.convert:
+                ProviderUtils.convert[provider].working = False
+
     return app
 
-def create_app_debug(g4f_api_key: str = None):
+def create_app_debug():
     g4f.debug.logging = True
-    return create_app(g4f_api_key)
+    return create_app()
+
+def create_app_with_gui_and_debug():
+    g4f.debug.logging = True
+    AppConfig.gui = True
+    return create_app()
 
 class ChatCompletionsConfig(BaseModel):
     messages: Messages = Field(examples=[[{"role": "system", "content": ""}, {"role": "user", "content": ""}]])
     model: str = Field(default="")
-    provider: Optional[str] = Field(examples=[None])
+    provider: Optional[str] = None
     stream: bool = False
-    temperature: Optional[float] = Field(examples=[None])
-    max_tokens: Optional[int] = Field(examples=[None])
-    stop: Union[list[str], str, None] = Field(examples=[None])
-    api_key: Optional[str] = Field(examples=[None])
-    web_search: Optional[bool] = Field(examples=[None])
-    proxy: Optional[str] = Field(examples=[None])
-    conversation_id: Optional[str] = Field(examples=[None])
+    image: Optional[str] = None
+    image_name: Optional[str] = None
+    images: Optional[list[tuple[str, str]]] = None
+    temperature: Optional[float] = None
+    max_tokens: Optional[int] = None
+    stop: Union[list[str], str, None] = None
+    api_key: Optional[str] = None
+    web_search: Optional[bool] = None
+    proxy: Optional[str] = None
+    conversation_id: Optional[str] = None
+    history_disabled: Optional[bool] = None
+    auto_continue: Optional[bool] = None
+    timeout: Optional[int] = None
 
 class ImageGenerationConfig(BaseModel):
     prompt: str
     model: Optional[str] = None
     provider: Optional[str] = None
-    response_format: str = "url"
+    response_format: Optional[str] = None
     api_key: Optional[str] = None
     proxy: Optional[str] = None
 
@@ -138,7 +156,7 @@ class ErrorResponseMessageModel(BaseModel):
 
 class FileResponseModel(BaseModel):
     filename: str
-    
+
 class ErrorResponse(Response):
     media_type = "application/json"
 
@@ -149,8 +167,8 @@ class ErrorResponse(Response):
         return cls(format_exception(exception, config), status_code)
 
     @classmethod
-    def from_message(cls, message: str, status_code: int = HTTP_500_INTERNAL_SERVER_ERROR):
-        return cls(format_exception(message), status_code)
+    def from_message(cls, message: str, status_code: int = HTTP_500_INTERNAL_SERVER_ERROR, headers: dict = None):
+        return cls(format_exception(message), status_code, headers=headers)
 
     def render(self, content) -> bytes:
         return str(content).encode(errors="ignore")
@@ -159,7 +177,7 @@ class AppConfig:
     ignored_providers: Optional[list[str]] = None
     g4f_api_key: Optional[str] = None
     ignore_cookie_files: bool = False
-    model: str = None,
+    model: str = None
     provider: str = None
     image_provider: str = None
     proxy: str = None
@@ -170,33 +188,58 @@ class AppConfig:
         for key, value in data.items():
             setattr(cls, key, value)
 
-list_ignored_providers: list[str] = None
-
-def set_list_ignored_providers(ignored: list[str]):
-    global list_ignored_providers
-    list_ignored_providers = ignored
-
 class Api:
-    def __init__(self, app: FastAPI, g4f_api_key=None) -> None:
+    def __init__(self, app: FastAPI) -> None:
         self.app = app
         self.client = AsyncClient()
-        self.g4f_api_key = g4f_api_key
         self.get_g4f_api_key = APIKeyHeader(name="g4f-api-key")
         self.conversations: dict[str, dict[str, BaseConversation]] = {}
 
     security = HTTPBearer(auto_error=False)
+    basic_security = HTTPBasic()
+
+    async def get_username(self, request: Request):
+        credentials = await self.basic_security(request)
+        current_password_bytes = credentials.password.encode()
+        is_correct_password = secrets.compare_digest(
+            current_password_bytes, AppConfig.g4f_api_key.encode()
+        )
+        if not is_correct_password:
+            raise HTTPException(
+                status_code=HTTP_401_UNAUTHORIZED,
+                detail="Incorrect username or password",
+                headers={"WWW-Authenticate": "Basic"},
+            )
+        return credentials.username
 
     def register_authorization(self):
+        if AppConfig.g4f_api_key:
+            print(f"Register authentication key: {''.join(['*' for _ in range(len(AppConfig.g4f_api_key))])}")
         @self.app.middleware("http")
         async def authorization(request: Request, call_next):
-            if self.g4f_api_key and request.url.path not in ("/", "/v1"):
+            if AppConfig.g4f_api_key is not None:
                 try:
                     user_g4f_api_key = await self.get_g4f_api_key(request)
-                except HTTPException as e:
-                    if e.status_code == 403:
+                except HTTPException:
+                    user_g4f_api_key = None
+                if request.url.path.startswith("/v1"):
+                    if user_g4f_api_key is None:
                         return ErrorResponse.from_message("G4F API key required", HTTP_401_UNAUTHORIZED)
-                if not secrets.compare_digest(self.g4f_api_key, user_g4f_api_key):
-                    return ErrorResponse.from_message("Invalid G4F API key", HTTP_403_FORBIDDEN)
+                    if not secrets.compare_digest(AppConfig.g4f_api_key, user_g4f_api_key):
+                        return ErrorResponse.from_message("Invalid G4F API key", HTTP_403_FORBIDDEN)
+                else:
+                    path = request.url.path
+                    if user_g4f_api_key is not None and path.startswith("/images/"):
+                        if not secrets.compare_digest(AppConfig.g4f_api_key, user_g4f_api_key):
+                            return ErrorResponse.from_message("Invalid G4F API key", HTTP_403_FORBIDDEN)
+                    elif path.startswith("/backend-api/") or path.startswith("/images/") or path.startswith("/chat/") and path != "/chat/":
+                        try:
+                            username = await self.get_username(request)
+                        except HTTPException as e:
+                            return ErrorResponse.from_message(e.detail, e.status_code, e.headers)
+                        response = await call_next(request)
+                        response.headers["X-Username"] = username
+                        return response
             return await call_next(request)
 
     def register_validation_exception_handler(self):
@@ -233,16 +276,12 @@ class Api:
             HTTP_200_OK: {"model": List[ModelResponseModel]},
         })
         async def models():
-            model_list = dict(
-                (model, g4f.models.ModelUtils.convert[model])
-                for model in g4f.Model.__all__()
-            )
             return [{
                 'id': model_id,
                 'object': 'model',
                 'created': 0,
                 'owned_by': model.base_provider
-            } for model_id, model in model_list.items()]
+            } for model_id, model in g4f.models.ModelUtils.convert.items()]
 
         @self.app.get("/v1/models/{model_name}", responses={
             HTTP_200_OK: {"model": ModelResponseModel},
@@ -263,6 +302,7 @@ class Api:
             HTTP_200_OK: {"model": ChatCompletion},
             HTTP_401_UNAUTHORIZED: {"model": ErrorResponseModel},
             HTTP_404_NOT_FOUND: {"model": ErrorResponseModel},
+            HTTP_422_UNPROCESSABLE_ENTITY: {"model": ErrorResponseModel},
             HTTP_500_INTERNAL_SERVER_ERROR: {"model": ErrorResponseModel},
         })
         async def chat_completions(
@@ -284,6 +324,18 @@ class Api:
                         if config.provider in self.conversations[config.conversation_id]:
                             conversation = self.conversations[config.conversation_id][config.provider]
 
+                if config.image is not None:
+                    try:
+                        is_data_uri_an_image(config.image)
+                    except ValueError as e:
+                        return ErrorResponse.from_message(f"The image you send must be a data URI. Example: data:image/jpeg;base64,...", status_code=HTTP_422_UNPROCESSABLE_ENTITY)
+                if config.images is not None:
+                    for image in config.images:
+                        try:
+                            is_data_uri_an_image(image[0])
+                        except ValueError as e:
+                            example = json.dumps({"images": [["data:image/jpeg;base64,...", "filename"]]})
+                            return ErrorResponse.from_message(f'The image you send must be a data URI. Example: {example}', status_code=HTTP_422_UNPROCESSABLE_ENTITY)
                 # Create the completion response
                 response = self.client.chat.completions.create(
                     **filter_none(
@@ -356,9 +408,9 @@ class Api:
                     model=config.model,
                     provider=AppConfig.image_provider if config.provider is None else config.provider,
                     **filter_none(
-                        response_format = config.response_format,
-                        api_key = config.api_key,
-                        proxy = config.proxy
+                        response_format=config.response_format,
+                        api_key=config.api_key,
+                        proxy=config.proxy
                     )
                 )
                 for image in response.data:
@@ -417,15 +469,17 @@ class Api:
         })
         def upload_cookies(files: List[UploadFile]):
             response_data = []
-            for file in files:
-                try:
-                    if file and file.filename.endswith(".json") or file.filename.endswith(".har"):
-                        filename = os.path.basename(file.filename)
-                        with open(os.path.join(get_cookies_dir(), filename), 'wb') as f:
-                            shutil.copyfileobj(file.file, f)
-                        response_data.append({"filename": filename})
-                finally:
-                    file.file.close()
+            if not AppConfig.ignore_cookie_files:
+                for file in files:
+                    try:
+                        if file and file.filename.endswith(".json") or file.filename.endswith(".har"):
+                            filename = os.path.basename(file.filename)
+                            with open(os.path.join(get_cookies_dir(), filename), 'wb') as f:
+                                shutil.copyfileobj(file.file, f)
+                            response_data.append({"filename": filename})
+                    finally:
+                        file.file.close()
+                read_cookie_files()
             return response_data
 
         @self.app.get("/v1/synthesize/{provider}", responses={
@@ -476,15 +530,15 @@ def format_exception(e: Union[Exception, str], config: Union[ChatCompletionsConf
         message = f"{e.__class__.__name__}: {e}"
     return json.dumps({
         "error": {"message": message},
-        "model":  last_provider.get("model") if model is None else model,
         **filter_none(
+            model=last_provider.get("model") if model is None else model,
             provider=last_provider.get("name") if provider is None else provider
         )
     })
 
 def run_api(
     host: str = '0.0.0.0',
-    port: int = 1337,
+    port: int = None,
     bind: str = None,
     debug: bool = False,
     workers: int = None,
@@ -496,8 +550,14 @@ def run_api(
         use_colors = debug
     if bind is not None:
         host, port = bind.split(":")
+    if port is None:
+        port = DEFAULT_PORT
+    if AppConfig.gui and debug:
+        method = "create_app_with_gui_and_debug"
+    else:
+        method = "create_app_debug" if debug else "create_app"
     uvicorn.run(
-        f"g4f.api:create_app{'_debug' if debug else ''}", 
+        f"g4f.api:{method}", 
         host=host, 
         port=int(port), 
         workers=workers, 

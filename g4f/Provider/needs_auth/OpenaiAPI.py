@@ -1,22 +1,43 @@
 from __future__ import annotations
 
 import json
+import requests
 
 from ..helper import filter_none
 from ..base_provider import AsyncGeneratorProvider, ProviderModelMixin, FinishReason
-from ...typing import Union, Optional, AsyncResult, Messages, ImageType
+from ...typing import Union, Optional, AsyncResult, Messages, ImagesType
 from ...requests import StreamSession, raise_for_status
 from ...errors import MissingAuthError, ResponseError
 from ...image import to_data_uri
+from ... import debug
 
 class OpenaiAPI(AsyncGeneratorProvider, ProviderModelMixin):
     label = "OpenAI API"
     url = "https://platform.openai.com"
+    api_base = "https://api.openai.com/v1"
     working = True
     needs_auth = True
     supports_message_history = True
     supports_system_message = True
     default_model = ""
+    fallback_models = []
+
+    @classmethod
+    def get_models(cls, api_key: str = None, api_base: str = api_base) -> list[str]:
+        if not cls.models:
+            try:
+                headers = {}
+                if api_key is not None:
+                    headers["authorization"] = f"Bearer {api_key}"
+                response = requests.get(f"{api_base}/models", headers=headers)
+                raise_for_status(response)
+                data = response.json()
+                cls.models = [model.get("id") for model in data.get("data")]
+                cls.models.sort()
+            except Exception as e:
+                debug.log(e)
+                cls.models = cls.fallback_models
+        return cls.models
 
     @classmethod
     async def create_async_generator(
@@ -25,9 +46,9 @@ class OpenaiAPI(AsyncGeneratorProvider, ProviderModelMixin):
         messages: Messages,
         proxy: str = None,
         timeout: int = 120,
-        image: ImageType = None,
+        images: ImagesType = None,
         api_key: str = None,
-        api_base: str = "https://api.openai.com/v1",
+        api_base: str = api_base,
         temperature: float = None,
         max_tokens: int = None,
         top_p: float = None,
@@ -40,28 +61,28 @@ class OpenaiAPI(AsyncGeneratorProvider, ProviderModelMixin):
     ) -> AsyncResult:
         if cls.needs_auth and api_key is None:
             raise MissingAuthError('Add a "api_key"')
-        if image is not None:
+        if images is not None:
             if not model and hasattr(cls, "default_vision_model"):
                 model = cls.default_vision_model
             messages[-1]["content"] = [
-                {
+                *[{
                     "type": "image_url",
                     "image_url": {"url": to_data_uri(image)}
-                },
+                } for image, _ in images],
                 {
                     "type": "text",
                     "text": messages[-1]["content"]
                 }
             ]
         async with StreamSession(
-            proxies={"all": proxy},
+            proxy=proxy,
             headers=cls.get_headers(stream, api_key, headers),
             timeout=timeout,
             impersonate=impersonate,
         ) as session:
             data = filter_none(
                 messages=messages,
-                model=cls.get_model(model),
+                model=cls.get_model(model, api_key=api_key, api_base=api_base),
                 temperature=temperature,
                 max_tokens=max_tokens,
                 top_p=top_p,
@@ -111,7 +132,10 @@ class OpenaiAPI(AsyncGeneratorProvider, ProviderModelMixin):
         if "error_message" in data:
             raise ResponseError(data["error_message"])
         elif "error" in data:
-            raise ResponseError(f'Error {data["error"]["code"]}: {data["error"]["message"]}')
+            if "code" in data["error"]:
+                raise ResponseError(f'Error {data["error"]["code"]}: {data["error"]["message"]}')
+            else:
+                raise ResponseError(data["error"]["message"])
 
     @classmethod
     def get_headers(cls, stream: bool, api_key: str = None, headers: dict = None) -> dict:

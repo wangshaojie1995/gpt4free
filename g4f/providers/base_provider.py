@@ -57,7 +57,9 @@ class AbstractProvider(BaseProvider):
         loop = loop or asyncio.get_running_loop()
 
         def create_func() -> str:
-            return "".join(cls.create_completion(model, messages, False, **kwargs))
+            chunks = [str(chunk) for chunk in cls.create_completion(model, messages, False, **kwargs) if chunk]
+            if chunks:
+                return "".join(chunks)
 
         return await asyncio.wait_for(
             loop.run_in_executor(executor, create_func),
@@ -96,7 +98,7 @@ class AbstractProvider(BaseProvider):
             default_value = f'"{param.default}"' if isinstance(param.default, str) else param.default
             args += f" = {default_value}" if param.default is not Parameter.empty else ""
             args += ","
-        
+
         return f"g4f.Provider.{cls.__name__} supports: ({args}\n)"
 
 class AsyncProvider(AbstractProvider):
@@ -205,7 +207,7 @@ class AsyncGeneratorProvider(AsyncProvider):
         """
         return "".join([
             str(chunk) async for chunk in cls.create_async_generator(model, messages, stream=False, **kwargs) 
-            if not isinstance(chunk, (Exception, FinishReason, BaseConversation, SynthesizeData))
+            if chunk and not isinstance(chunk, (Exception, FinishReason, BaseConversation, SynthesizeData))
         ])
 
     @staticmethod
@@ -238,20 +240,23 @@ class ProviderModelMixin:
     models: list[str] = []
     model_aliases: dict[str, str] = {}
     image_models: list = None
+    last_model: str = None
 
     @classmethod
-    def get_models(cls) -> list[str]:
+    def get_models(cls, **kwargs) -> list[str]:
         if not cls.models and cls.default_model is not None:
             return [cls.default_model]
         return cls.models
 
     @classmethod
-    def get_model(cls, model: str) -> str:
+    def get_model(cls, model: str, **kwargs) -> str:
         if not model and cls.default_model is not None:
             model = cls.default_model
         elif model in cls.model_aliases:
             model = cls.model_aliases[model]
-        elif model not in cls.get_models() and cls.models:
-            raise ModelNotSupportedError(f"Model is not supported: {model} in: {cls.__name__}")
+        else:
+            if model not in cls.get_models(**kwargs) and cls.models:
+                raise ModelNotSupportedError(f"Model is not supported: {model} in: {cls.__name__}")
+        cls.last_model = model
         debug.last_model = model
         return model

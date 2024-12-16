@@ -3,7 +3,7 @@ const message_box       = document.getElementById(`messages`);
 const messageInput      = document.getElementById(`message-input`);
 const box_conversations = document.querySelector(`.top`);
 const stop_generating   = document.querySelector(`.stop_generating`);
-const regenerate        = document.querySelector(`.regenerate`);
+const regenerate_button = document.querySelector(`.regenerate`);
 const sidebar           = document.querySelector(".conversations");
 const sidebar_button    = document.querySelector(".mobile-sidebar");
 const sendButton        = document.getElementById("send-button");
@@ -21,7 +21,7 @@ const chat              = document.querySelector(".conversation");
 const album             = document.querySelector(".images");
 const log_storage       = document.querySelector(".log");
 
-const optionElements = document.querySelectorAll(".settings input, .settings textarea, #model, #model2, #provider")
+const optionElementsSelector = ".settings input, .settings textarea, #model, #model2, #provider";
 
 let provider_storage = {};
 let message_storage = {};
@@ -44,6 +44,9 @@ appStorage = window.localStorage || {
     removeItem: (key) => delete self[key],
     length: 0
 }
+
+appStorage.getItem("darkMode") == "false" ? document.body.classList.add("white") : null;
+
 let markdown_render = () => null;
 if (window.markdownit) {
     const markdown = window.markdownit();
@@ -56,6 +59,7 @@ if (window.markdownit) {
             .replaceAll('<code>', '<code class="language-plaintext">')
     }
 }
+
 function filter_message(text) {
     return text.replaceAll(
         /<!-- generated images start -->[\s\S]+<!-- generated images end -->/gm, ""
@@ -81,7 +85,52 @@ function fallback_clipboard (text) {
     document.body.removeChild(textBox);
 }
 
+const iframe_container = Object.assign(document.createElement("div"), {
+    className: "hljs-iframe-container hidden",
+});
+const iframe = Object.assign(document.createElement("iframe"), {
+    className: "hljs-iframe",
+});
+iframe_container.appendChild(iframe);
+const iframe_close = Object.assign(document.createElement("button"), {
+    className: "hljs-iframe-close",
+    innerHTML: '<i class="fa-regular fa-x"></i>',
+});
+iframe_close.onclick = () => iframe_container.classList.add("hidden");
+iframe_container.appendChild(iframe_close);
+chat.appendChild(iframe_container);
+
+class HtmlRenderPlugin {
+    constructor(options = {}) {
+        self.hook = options.hook;
+        self.callback = options.callback
+    }
+    "after:highlightElement"({
+        el,
+        text
+    }) {
+        if (!el.classList.contains("language-html")) {
+            return;
+        }
+        let button = Object.assign(document.createElement("button"), {
+            innerHTML: '<i class="fa-regular fa-folder-open"></i>',
+            className: "hljs-iframe-button",
+        });
+        el.parentElement.appendChild(button);
+        button.onclick = async () => {
+            let newText = text;
+            if (hook && typeof hook === "function") {
+                newText = hook(text, el) || text
+            }
+            iframe.src = `data:text/html;charset=utf-8,${encodeURIComponent(newText)}`;
+            iframe_container.classList.remove("hidden");
+            if (typeof callback === "function") return callback(newText, el);
+        }
+    }
+}
+
 hljs.addPlugin(new CopyButtonPlugin());
+hljs.addPlugin(new HtmlRenderPlugin())
 let typesetPromise = Promise.resolve();
 const highlight = (container) => {
     container.querySelectorAll('code:not(.hljs').forEach((el) => {
@@ -284,7 +333,7 @@ const handle_ask = async () => {
     }
     messageInput.value = "";
     await count_input()
-    await add_conversation(window.conversation_id, message);
+    await add_conversation(window.conversation_id);
 
     if ("text" in fileInput.dataset) {
         message += '\n```' + fileInput.dataset.type + '\n'; 
@@ -294,11 +343,18 @@ const handle_ask = async () => {
     let message_index = await add_message(window.conversation_id, "user", message);
     let message_id = get_message_id();
 
-    if (imageInput.dataset.src) URL.revokeObjectURL(imageInput.dataset.src);
+    if (imageInput.dataset.objects) {
+        imageInput.dataset.objects.split(" ").forEach((object)=>URL.revokeObjectURL(object))
+        delete imageInput.dataset.objects;
+    }
     const input = imageInput && imageInput.files.length > 0 ? imageInput : cameraInput
-    if (input.files.length > 0) imageInput.dataset.src = URL.createObjectURL(input.files[0]);
-    else delete imageInput.dataset.src
-
+    images = [];
+    if (input.files.length > 0) {
+        for (const file of input.files) {
+            images.push(URL.createObjectURL(file));
+        }
+        imageInput.dataset.objects = images.join(" ");
+    }
     message_box.innerHTML += `
         <div class="message" data-index="${message_index}">
             <div class="user">
@@ -309,13 +365,10 @@ const handle_ask = async () => {
             <div class="content" id="user_${message_id}"> 
                 <div class="content_inner">
                 ${markdown_render(message)}
-                ${imageInput.dataset.src
-                    ? '<img src="' + imageInput.dataset.src + '" alt="Image upload">'
-                    : ''
-                }
+                ${images.map((object)=>'<img src="' + object + '" alt="Image upload">').join("")}
                 </div>
                 <div class="count">
-                    ${count_words_and_tokens(message, get_selected_model())}
+                    ${count_words_and_tokens(message, get_selected_model()?.value)}
                     <i class="fa-solid fa-volume-high"></i>
                     <i class="fa-regular fa-clipboard"></i>
                     <a><i class="fa-brands fa-whatsapp"></i></a>
@@ -326,7 +379,19 @@ const handle_ask = async () => {
         </div>
     `;
     highlight(message_box);
-    await ask_gpt(message_id);
+
+    const all_pinned = document.querySelectorAll(".buttons button.pinned")
+    if (all_pinned.length > 0) {
+        all_pinned.forEach((el, idx) => ask_gpt(
+            idx == 0 ? message_id : get_message_id(),
+            -1,
+            idx != 0,
+            el.dataset.provider,
+            el.dataset.model
+        ));
+    } else {
+        await ask_gpt(message_id);
+    }
 };
 
 async function safe_remove_cancel_button() {
@@ -338,16 +403,21 @@ async function safe_remove_cancel_button() {
     stop_generating.classList.add("stop_generating-hidden");
 }
 
-regenerate.addEventListener("click", async () => {
-    regenerate.classList.add("regenerate-hidden");
-    setTimeout(()=>regenerate.classList.remove("regenerate-hidden"), 3000);
-    await hide_message(window.conversation_id);
-    await ask_gpt(get_message_id());
+regenerate_button.addEventListener("click", async () => {
+    regenerate_button.classList.add("regenerate-hidden");
+    setTimeout(()=>regenerate_button.classList.remove("regenerate-hidden"), 3000);
+    const all_pinned = document.querySelectorAll(".buttons button.pinned")
+    if (all_pinned.length > 0) {
+        all_pinned.forEach((el) => ask_gpt(get_message_id(), -1, true, el.dataset.provider, el.dataset.model));
+    } else {
+        await hide_message(window.conversation_id);
+        await ask_gpt(get_message_id());
+    }
 });
 
 stop_generating.addEventListener("click", async () => {
     stop_generating.classList.add("stop_generating-hidden");
-    regenerate.classList.remove("regenerate-hidden");
+    regenerate_button.classList.remove("regenerate-hidden");
     let key;
     for (key in controller_storage) {
         if (!controller_storage[key].signal.aborted) {
@@ -371,16 +441,17 @@ document.querySelector(".media_player .fa-x").addEventListener("click", ()=>{
 });
 
 const prepare_messages = (messages, message_index = -1) => {
-    if (message_index >= 0) {
-        messages = messages.filter((_, index) => message_index >= index);
-    }
-
-    // Removes none user messages at end
-    let last_message;
-    while (last_message = messages.pop()) {
-        if (last_message["role"] == "user") {
-            messages.push(last_message);
-            break;
+    if (message_index != null) {
+        if (message_index >= 0) {
+            messages = messages.filter((_, index) => message_index >= index);
+        }
+        // Removes none user messages at end
+        let last_message;
+        while (last_message = messages.pop()) {
+            if (last_message["role"] == "user") {
+                messages.push(last_message);
+                break;
+            }
         }
     }
 
@@ -432,11 +503,13 @@ async function add_message_chunk(message, message_id) {
     } else if (message.type == "error") {
         error_storage[message_id] = message.error
         console.error(message.error);
-        content_map.inner.innerHTML += `<p><strong>An error occured:</strong> ${message.error}</p>`;
+        content_map.inner.innerHTML += markdown_render(`**An error occured:** ${message.error}`);
         let p = document.createElement("p");
         p.innerText = message.error;
         log_storage.appendChild(p);
     } else if (message.type == "preview") {
+        if (content_map.inner.clientHeight > 200)
+            content_map.inner.style.height = content_map.inner.clientHeight + "px";
         content_map.inner.innerHTML = markdown_render(message.preview);
     } else if (message.type == "content") {
         message_storage[message_id] += message.content;
@@ -455,6 +528,7 @@ async function add_message_chunk(message, message_id) {
         content_map.inner.innerHTML = html;
         content_map.count.innerText = count_words_and_tokens(message_storage[message_id], provider_storage[message_id]?.model);
         highlight(content_map.inner);
+        content_map.inner.style.height = "";
     } else if (message.type == "log") {
         let p = document.createElement("p");
         p.innerText = message.log;
@@ -474,21 +548,11 @@ async function add_message_chunk(message, message_id) {
     }
 }
 
-cameraInput?.addEventListener("click", (e) => {
-    if (window?.pywebview) {
-        e.preventDefault();
-        pywebview.api.take_picture();
+const ask_gpt = async (message_id, message_index = -1, regenerate = false, provider = null, model = null) => {
+    if (!model && !provider) {
+        model = get_selected_model()?.value || null;
+        provider = providerSelect.options[providerSelect.selectedIndex].value;
     }
-});
-
-imageInput?.addEventListener("click", (e) => {
-    if (window?.pywebview) {
-        e.preventDefault();
-        pywebview.api.choose_image();
-    }
-});
-
-const ask_gpt = async (message_id, message_index = -1) => {
     let messages = await get_messages(window.conversation_id);
     messages = prepare_messages(messages, message_index);
     message_storage[message_id] = "";
@@ -503,7 +567,7 @@ const ask_gpt = async (message_id, message_index = -1) => {
 
     const message_el = document.createElement("div");
     message_el.classList.add("message");
-    if (message_index != -1) {
+    if (message_index != -1 || regenerate) {
         message_el.classList.add("regenerate");
     }
     message_el.innerHTML += `
@@ -542,22 +606,23 @@ const ask_gpt = async (message_id, message_index = -1) => {
     }
     try {
         const input = imageInput && imageInput.files.length > 0 ? imageInput : cameraInput;
-        const file = input && input.files.length > 0 ? input.files[0] : null;
-        const provider = providerSelect.options[providerSelect.selectedIndex].value;
+        const files = input && input.files.length > 0 ? input.files : null;
         const auto_continue = document.getElementById("auto_continue")?.checked;
         const download_images = document.getElementById("download_images")?.checked;
-        let api_key = get_api_key_by_provider(provider);
+        const api_key = get_api_key_by_provider(provider);
+        const ignored = Array.from(settings.querySelectorAll("input.provider:not(:checked)")).map((el)=>el.value);
         await api("conversation", {
             id: message_id,
             conversation_id: window.conversation_id,
-            model: get_selected_model(),
+            model: model,
             web_search: document.getElementById("switch").checked,
             provider: provider,
             messages: messages,
             auto_continue: auto_continue,
             download_images: download_images,
             api_key: api_key,
-        }, file, message_id);
+            ignored: ignored,
+        }, files, message_id);
         if (!error_storage[message_id]) {
             html = markdown_render(message_storage[message_id]);
             content_map.inner.innerHTML = html;
@@ -570,7 +635,7 @@ const ask_gpt = async (message_id, message_index = -1) => {
         console.error(e);
         if (e.name != "AbortError") {
             error_storage[message_id] = true;
-            content_map.inner.innerHTML += `<p><strong>An error occured:</strong> ${e}</p>`;
+            content_map.inner.innerHTML += markdown_render(`**An error occured:** ${e}`);
         }
     }
     delete controller_storage[message_id];
@@ -582,7 +647,8 @@ const ask_gpt = async (message_id, message_index = -1) => {
             message_storage[message_id],
             message_provider,
             message_index,
-            synthesize_storage[message_id]
+            synthesize_storage[message_id],
+            regenerate
         );
         await safe_load_conversation(window.conversation_id, message_index == -1);
     } else {
@@ -595,7 +661,7 @@ const ask_gpt = async (message_id, message_index = -1) => {
     await safe_remove_cancel_button();
     await register_message_buttons();
     await load_conversations();
-    regenerate.classList.remove("regenerate-hidden");
+    regenerate_button.classList.remove("regenerate-hidden");
 };
 
 async function scroll_to_bottom() {
@@ -694,19 +760,23 @@ const delete_conversation = async (conversation_id) => {
 };
 
 const set_conversation = async (conversation_id) => {
-    history.pushState({}, null, `/chat/${conversation_id}`);
+    try {
+        history.pushState({}, null, `/chat/${conversation_id}`);
+    } catch (e) {
+        console.error(e);
+    }
     window.conversation_id = conversation_id;
 
     await clear_conversation();
     await load_conversation(conversation_id);
     load_conversations();
     hide_sidebar();
-    log_storage.classList.add("hidden");
 };
 
 const new_conversation = async () => {
     history.pushState({}, null, `/chat/`);
     window.conversation_id = uuid();
+    document.title = window.title || document.title;
 
     await clear_conversation();
     if (systemPrompt) {
@@ -714,7 +784,6 @@ const new_conversation = async () => {
     }
     load_conversations();
     hide_sidebar();
-    log_storage.classList.add("hidden");
     say_hello();
 };
 
@@ -725,6 +794,8 @@ const load_conversation = async (conversation_id, scroll=true) => {
     if (!conversation) {
         return;
     }
+
+    document.title = conversation.new_title ? `g4f - ${conversation.new_title}` : document.title;
 
     if (systemPrompt) {
         systemPrompt.value = conversation.system || "";
@@ -783,7 +854,7 @@ const load_conversation = async (conversation_id, scroll=true) => {
     if (window.GPTTokenizer_cl100k_base) {
         const filtered = prepare_messages(messages, null);
         if (filtered.length > 0) {
-            last_model = last_model?.startsWith("gpt-4") ? "gpt-4" : "gpt-3.5-turbo"
+            last_model = last_model?.startsWith("gpt-3") ? "gpt-3.5-turbo" : "gpt-4"
             let count_total = GPTTokenizer_cl100k_base?.encodeChat(filtered, last_model).length
             if (count_total > 0) {
                 elements += `<div class="count_total">(${count_total} tokens used)</div>`;
@@ -794,7 +865,7 @@ const load_conversation = async (conversation_id, scroll=true) => {
     message_box.innerHTML = elements;
     register_message_buttons();
     highlight(message_box);
-    regenerate.classList.remove("regenerate-hidden");
+    regenerate_button.classList.remove("regenerate-hidden");
 
     if (scroll) {
         message_box.scrollTo({ top: message_box.scrollHeight, behavior: "smooth" });
@@ -838,7 +909,7 @@ async function get_messages(conversation_id) {
     return conversation?.items || [];
 }
 
-async function add_conversation(conversation_id, content) {
+async function add_conversation(conversation_id) {
     if (appStorage.getItem(`conversation:${conversation_id}`) == null) {
         await save_conversation(conversation_id, {
             id: conversation_id,
@@ -848,7 +919,11 @@ async function add_conversation(conversation_id, content) {
             items: [],
         });
     }
-    history.pushState({}, null, `/chat/${conversation_id}`);
+    try {
+        history.pushState({}, null, `/chat/${conversation_id}`);
+    } catch (e) {
+        console.error(e);
+    }
 }
 
 async function save_system_message() {
@@ -902,7 +977,8 @@ const add_message = async (
     conversation_id, role, content,
     provider = null,
     message_index = -1,
-    synthesize_data = null
+    synthesize_data = null,
+    regenerate = false
 ) => {
     const conversation = await get_conversation(conversation_id);
     if (!conversation) return;
@@ -913,6 +989,9 @@ const add_message = async (
     };
     if (synthesize_data) {
         new_message.synthesize = synthesize_data;
+    }
+    if (regenerate) {
+        new_message.regenerate = true;
     }
     if (message_index == -1) {
          conversation.items.push(new_message);
@@ -1015,6 +1094,7 @@ async function hide_sidebar() {
     sidebar_button.classList.remove("rotated");
     settings.classList.add("hidden");
     chat.classList.remove("hidden");
+    log_storage.classList.add("hidden");
     if (window.location.pathname == "/menu/" || window.location.pathname == "/settings/") {
         history.back();
     }
@@ -1022,10 +1102,10 @@ async function hide_sidebar() {
 
 window.addEventListener('popstate', hide_sidebar, false);
 
-sidebar_button.addEventListener("click", (event) => {
+sidebar_button.addEventListener("click", async () => {
     settings.classList.add("hidden");
     if (sidebar.classList.contains("shown")) {
-        hide_sidebar();
+        await hide_sidebar();
     } else {
         sidebar.classList.add("shown");
         sidebar_button.classList.add("rotated");
@@ -1047,18 +1127,8 @@ function open_settings() {
     log_storage.classList.add("hidden");
 }
 
-function open_album() {
-    if (album.classList.contains("hidden")) {
-        sidebar.classList.remove("shown");
-        settings.classList.add("hidden");
-        album.classList.remove("hidden");
-        history.pushState({}, null, "/images/");
-    } else {
-        album.classList.add("hidden");
-    }
-}
-
 const register_settings_storage = async () => {
+    const optionElements = document.querySelectorAll(optionElementsSelector);
     optionElements.forEach((element) => {
         if (element.type == "textarea") {
             element.addEventListener('input', async (event) => {
@@ -1086,6 +1156,7 @@ const register_settings_storage = async () => {
 }
 
 const load_settings_storage = async () => {
+    const optionElements = document.querySelectorAll(optionElementsSelector);
     optionElements.forEach((element) => {
         if (!(value = appStorage.getItem(element.id))) {
             return;
@@ -1132,31 +1203,6 @@ const say_hello = async () => {
     }
 }
 
-// Theme storage for recurring viewers
-const storeTheme = function (theme) {
-    appStorage.setItem("theme", theme);
-};
-
-// set theme when visitor returns
-const setTheme = function () {
-    const activeTheme = appStorage.getItem("theme");
-    colorThemes.forEach((themeOption) => {
-        if (themeOption.id === activeTheme) {
-            themeOption.checked = true;
-        }
-    });
-    // fallback for no :has() support
-    document.documentElement.className = activeTheme;
-};
-
-colorThemes.forEach((themeOption) => {
-    themeOption.addEventListener("click", () => {
-        storeTheme(themeOption.id);
-        // fallback for no :has() support
-        document.documentElement.className = themeOption.id;
-    });
-});
-
 function count_tokens(model, text) {
     if (model) {
         if (window.llamaTokenizer)
@@ -1171,6 +1217,7 @@ function count_tokens(model, text) {
     if (window.GPTTokenizer_cl100k_base) {
         return GPTTokenizer_cl100k_base.encode(text).length;
     }
+    return 0;
 }
 
 function count_words(text) {
@@ -1192,7 +1239,7 @@ const count_input = async () => {
     if (timeoutId) clearTimeout(timeoutId);
     timeoutId = setTimeout(() => {
         if (countFocus.value) {
-            inputCount.innerText = count_words_and_tokens(countFocus.value, get_selected_model());
+            inputCount.innerText = count_words_and_tokens(countFocus.value, get_selected_model()?.value);
         } else {
             inputCount.innerText = "";
         }
@@ -1210,22 +1257,19 @@ systemPrompt.addEventListener("input", function() {
 });
 
 window.addEventListener('load', async function() {
+    await safe_load_conversation(window.conversation_id, false);
+});
+
+window.addEventListener('DOMContentLoaded', async function() {
     await on_load();
     if (window.conversation_id == "{{chat_id}}") {
         window.conversation_id = uuid();
-    } else {
-        await on_api();
     }
-});
-
-window.addEventListener('pywebviewready', async function() {
     await on_api();
 });
 
 async function on_load() {
-    setTheme();
     count_input();
-
     if (/\/chat\/.+/.test(window.location.href)) {
         load_conversation(window.conversation_id);
     } else {
@@ -1234,14 +1278,46 @@ async function on_load() {
     load_conversations();
 }
 
+const load_provider_option = (input, provider_name) => {
+    if (input.checked) {
+        modelSelect.querySelectorAll(`option[data-disabled_providers*="${provider_name}"]`).forEach(
+            (el) => {
+                el.dataset.disabled_providers = el.dataset.disabled_providers ? el.dataset.disabled_providers.split(" ").filter((provider) => provider!=provider_name).join(" ") : "";
+                el.dataset.providers = (el.dataset.providers ? el.dataset.providers + " " : "") + provider_name;
+                modelSelect.querySelectorAll(`option[value="${el.value}"]`).forEach((o)=>o.removeAttribute("disabled", "disabled"))
+            }
+        );
+        providerSelect.querySelectorAll(`option[value="${provider_name}"]`).forEach(
+            (el) => el.removeAttribute("disabled")
+        );
+        providerSelect.querySelectorAll(`option[data-parent="${provider_name}"]`).forEach(
+            (el) => el.removeAttribute("disabled")
+        );
+        settings.querySelector(`.field:has(#${provider_name}-api_key)`)?.classList.remove("hidden");
+    } else {
+        modelSelect.querySelectorAll(`option[data-providers*="${provider_name}"]`).forEach(
+            (el) => {
+                el.dataset.providers = el.dataset.providers ? el.dataset.providers.split(" ").filter((provider) => provider!=provider_name).join(" ") : "";
+                el.dataset.disabled_providers = (el.dataset.disabled_providers ? el.dataset.disabled_providers + " " : "") + provider_name;
+                if (!el.dataset.providers) modelSelect.querySelectorAll(`option[value="${el.value}"]`).forEach((o)=>o.setAttribute("disabled", "disabled"))
+            }
+        );
+        providerSelect.querySelectorAll(`option[value="${provider_name}"]`).forEach(
+            (el) => el.setAttribute("disabled", "disabled")
+        );
+        providerSelect.querySelectorAll(`option[data-parent="${provider_name}"]`).forEach(
+            (el) => el.setAttribute("disabled", "disabled")
+        );
+        settings.querySelector(`.field:has(#${provider_name}-api_key)`)?.classList.add("hidden");
+    }
+};
+
 async function on_api() {
     let prompt_lock = false;
     messageInput.addEventListener("keydown", async (evt) => {
         if (prompt_lock) return;
-
-        // If not mobile
-        if (!window.matchMedia("(pointer:coarse)").matches)
-        if (evt.keyCode === 13 && !evt.shiftKey) {
+        // If not mobile and not shift enter
+        if (!window.matchMedia("(pointer:coarse)").matches && evt.keyCode === 13 && !evt.shiftKey) {
             evt.preventDefault();
             console.log("pressed enter");
             prompt_lock = true;
@@ -1260,26 +1336,57 @@ async function on_api() {
         await handle_ask();
     });
     messageInput.focus();
+    let provider_options = [];
+    try {
+        models = await api("models");
+        models.forEach((model) => {
+            let option = document.createElement("option");
+            option.value = model.name;
+            option.text = model.name + (model.image ? " (Image Generation)" : "");
+            option.dataset.providers = model.providers.join(" ");
+            modelSelect.appendChild(option);
+        });
+        providers = await api("providers")
+        providers.sort((a, b) => a.label.localeCompare(b.label));
+        providers.forEach((provider) => {
+            let option = document.createElement("option");
+            option.value = provider.name;
+            option.dataset.label = provider.label;
+            option.text = provider.label
+                + (provider.vision ? " (Image Upload)" : "")
+                + (provider.image ? " (Image Generation)" : "")
+                + (provider.webdriver ? " (Webdriver)" : "")
+                + (provider.auth ? " (Auth)" : "");
+            if (provider.parent)
+                option.dataset.parent = provider.parent;
+            providerSelect.appendChild(option);
 
+            if (!provider.parent) {
+                option = document.createElement("div");
+                option.classList.add("field");
+                option.innerHTML = `
+                    <span class="label">Enable ${provider.label}</span>
+                    <input id="Provider${provider.name}" type="checkbox" name="Provider${provider.name}" value="${provider.name}" class="provider" checked="">
+                    <label for="Provider${provider.name}" class="toogle" title="Remove provider from dropdown"></label>
+                `;
+                option.querySelector("input").addEventListener("change", (event) => load_provider_option(event.target, provider.name));
+                settings.querySelector(".paper").appendChild(option);
+                provider_options[provider.name] = option;
+            }
+        });
+        await load_provider_models(appStorage.getItem("provider"));
+    } catch (e) {
+        console.error(e)
+        // Redirect to show basic authenfication
+        if (document.location.pathname == "/chat/") {
+            document.location.href = `/chat/error`;
+        }
+    }
     register_settings_storage();
-
-    models = await api("models");
-    models.forEach((model) => {
-        let option = document.createElement("option");
-        option.value = option.text = model;
-        modelSelect.appendChild(option);
-    });
-
-    providers = await api("providers")
-    Object.entries(providers).forEach(([provider, label]) => {
-        let option = document.createElement("option");
-        option.value = provider;
-        option.text = label;
-        providerSelect.appendChild(option);
-    })
-
     await load_settings_storage()
-    await load_provider_models(appStorage.getItem("provider"));
+    Object.entries(provider_options).forEach(
+        ([provider_name, option]) => load_provider_option(option.querySelector("input"), provider_name)
+    );
 
     const hide_systemPrompt = document.getElementById("hide-systemPrompt")
     const slide_systemPrompt_icon = document.querySelector(".slide-systemPrompt i");
@@ -1297,7 +1404,7 @@ async function on_api() {
     });
     document.querySelector(".slide-systemPrompt")?.addEventListener("click", () => {
         hide_systemPrompt.click();
-        let checked = hide_systemPrompt.checked;
+        const checked = hide_systemPrompt.checked;
         systemPrompt.classList[checked ? "add": "remove"]("hidden");
         slide_systemPrompt_icon.classList[checked ? "remove": "add"]("fa-angles-up");
         slide_systemPrompt_icon.classList[checked ? "add": "remove"]("fa-angles-down");
@@ -1313,9 +1420,6 @@ async function on_api() {
     }
     const darkMode = document.getElementById("darkMode");
     if (darkMode) {
-        if (!darkMode.checked) {
-            document.body.classList.add("white");
-        }
         darkMode.addEventListener('change', async (event) => {
             if (event.target.checked) {
                 document.body.classList.remove("white");
@@ -1327,26 +1431,38 @@ async function on_api() {
 }
 
 async function load_version() {
+    let new_version = document.querySelector(".new_version");
+    if (new_version) return;
     const versions = await api("version");
-    document.title = 'g4f - ' + versions["version"];
+    window.title = 'g4f - ' + versions["version"];
+    if (document.title == "g4f - gui") {
+        document.title = window.title;
+    }
     let text = "version ~ "
     if (versions["version"] != versions["latest_version"]) {
-        let release_url = 'https://github.com/xtekky/gpt4free/releases/tag/' + versions["latest_version"];
+        let release_url = 'https://github.com/xtekky/gpt4free/releases/latest';
         let title = `New version: ${versions["latest_version"]}`;
         text += `<a href="${release_url}" target="_blank" title="${title}">${versions["version"]}</a> 🆕`;
+        new_version = document.createElement("div");
+        new_version.classList.add("new_version");
+        const link = `<a href="${release_url}" target="_blank" title="${title}">v${versions["latest_version"]}</a>`;
+        new_version.innerHTML = `g4f ${link}&nbsp;&nbsp;🆕`;
+        new_version.addEventListener("click", ()=>new_version.parentElement.removeChild(new_version));
+        document.body.appendChild(new_version);
     } else {
         text += versions["version"];
     }
     document.getElementById("version_text").innerHTML = text
+    setTimeout(load_version, 1000 * 60 * 60); // 1 hour
 }
-setTimeout(load_version, 2000);
+setTimeout(load_version, 100);
 
 [imageInput, cameraInput].forEach((el) => {
     el.addEventListener('click', async () => {
         el.value = '';
-        if (imageInput.dataset.src) {
-            URL.revokeObjectURL(imageInput.dataset.src);
-            delete imageInput.dataset.src
+        if (imageInput.dataset.objects) {
+            imageInput.dataset.objects.split(" ").forEach((object) => URL.revokeObjectURL(object));
+            delete imageInput.dataset.objects
         }
     });
 });
@@ -1411,22 +1527,16 @@ systemPrompt?.addEventListener("input", async () => {
 
 function get_selected_model() {
     if (modelProvider.selectedIndex >= 0) {
-        return modelProvider.options[modelProvider.selectedIndex].value;
+        return modelProvider.options[modelProvider.selectedIndex];
     } else if (modelSelect.selectedIndex >= 0) {
-        return modelSelect.options[modelSelect.selectedIndex].value;
+        model = modelSelect.options[modelSelect.selectedIndex];
+        if (model.value) {
+            return model;
+        }
     }
 }
 
-async function api(ressource, args=null, file=null, message_id=null) {
-    if (window?.pywebview) {
-        if (args !== null) {
-            if (ressource == "models") {
-                ressource = "provider_models";
-            }
-            return pywebview.api[`get_${ressource}`](args);
-        }
-        return pywebview.api[`get_${ressource}`]();
-    }
+async function api(ressource, args=null, files=null, message_id=null) {
     let api_key;
     if (ressource == "models" && args) {
         api_key = get_api_key_by_provider(args);
@@ -1435,14 +1545,16 @@ async function api(ressource, args=null, file=null, message_id=null) {
     const url = `/backend-api/v2/${ressource}`;
     const headers = {};
     if (api_key) {
-        headers.authorization = `Bearer ${api_key}`;
+        headers.x_api_key = api_key;
     }
     if (ressource == "conversation") {
         let body = JSON.stringify(args);
         headers.accept = 'text/event-stream';
-        if (file !== null) {
+        if (files !== null) {
             const formData = new FormData();
-            formData.append('file', file);
+            for (const file of files) {
+                formData.append('files[]', file)
+            }
             formData.append('json', body);
             body = formData;
         } else {
@@ -1486,8 +1598,9 @@ function get_api_key_by_provider(provider) {
     let api_key = null;
     if (provider) {
         api_key = document.getElementById(`${provider}-api_key`)?.value || null;
-        if (api_key == null)
+        if (api_key == null) {
             api_key = document.querySelector(`.${provider}-api_key`)?.value || null;
+        }
     }
     return api_key;
 }
@@ -1510,6 +1623,7 @@ async function load_provider_models(providerIndex=null) {
         models.forEach((model) => {
             let option = document.createElement('option');
             option.value = model.model;
+            option.dataset.label = model.model;
             option.text = `${model.model}${model.image ? " (Image Generation)" : ""}${model.vision ? " (Image Upload)" : ""}`;
             option.selected = model.default;
             modelProvider.appendChild(option);
@@ -1520,6 +1634,32 @@ async function load_provider_models(providerIndex=null) {
     }
 };
 providerSelect.addEventListener("change", () => load_provider_models());
+document.getElementById("pin").addEventListener("click", async () => {
+    const pin_container = document.getElementById("pin_container");
+    let selected_provider = providerSelect.options[providerSelect.selectedIndex];
+    selected_provider = selected_provider.value ? selected_provider : null;
+    const selected_model = get_selected_model();
+    if (selected_provider || selected_model) {
+        const pinned = document.createElement("button");
+        pinned.classList.add("pinned");
+        if (selected_provider) pinned.dataset.provider = selected_provider.value;
+        if (selected_model) pinned.dataset.model = selected_model.value;
+        pinned.innerHTML = `
+            <span>
+            ${selected_provider ? selected_provider.dataset.label || selected_provider.text : ""}
+            ${selected_provider && selected_model ? "/" : ""}
+            ${selected_model ? selected_model.dataset.label || selected_model.text : ""}
+            </span>
+            <i class="fa-regular fa-circle-xmark"></i>`;
+        pinned.addEventListener("click", () => pin_container.removeChild(pinned));
+        let all_pinned = pin_container.querySelectorAll(".pinned");
+        while (all_pinned.length > 4) {
+            pin_container.removeChild(all_pinned[0])
+            all_pinned = pin_container.querySelectorAll(".pinned");
+        }
+        pin_container.appendChild(pinned);
+    }
+});
 
 function save_storage() {
     let filename = `chat ${new Date().toLocaleString()}.json`.replaceAll(":", "-");
