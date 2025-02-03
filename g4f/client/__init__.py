@@ -9,10 +9,10 @@ import aiohttp
 import base64
 from typing import Union, AsyncIterator, Iterator, Awaitable, Optional
 
-from ..image import ImageResponse, copy_images
+from ..image.copy_images import copy_images
 from ..typing import Messages, ImageType
 from ..providers.types import ProviderType, BaseRetryProvider
-from ..providers.response import ResponseType, FinishReason, BaseConversation, SynthesizeData, ToolCalls, Usage
+from ..providers.response import ResponseType, ImageResponse, FinishReason, BaseConversation, SynthesizeData, ToolCalls, Usage
 from ..errors import NoImageResponseError
 from ..providers.retry_provider import IterListProvider
 from ..providers.asyncio import to_sync_generator
@@ -73,7 +73,18 @@ def iter_response(
         elif isinstance(chunk, Exception):
             continue
 
-        chunk = str(chunk)
+        if isinstance(chunk, list):
+            chunk = "".join(map(str, chunk))
+        else:
+
+            temp = chunk.__str__()
+            if not isinstance(temp, str):
+                if isinstance(temp, list):
+                    temp = "".join(map(str, temp))
+                else:
+                    temp = repr(chunk)
+            chunk = temp
+            
         content += chunk
 
         if max_tokens is not None and idx + 1 >= max_tokens:
