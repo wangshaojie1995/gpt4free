@@ -1,0 +1,389 @@
+"""PA Provider Downloader
+
+Downloads ``*.pa.py`` files from a GitHub repository (default:
+``gpt4free/pa-providers``) into the local g4f workspace directory
+(``~/.g4f/workspace`` by default, overridable with ``G4F_DIR``).
+
+Public API
+----------
+- :func:`run_pa_download`  — download (or update) PA providers from GitHub.
+- :func:`run_pa_list`      — list installed PA providers in the workspace.
+- :func:`run_pa_remove`    — remove a PA provider by filename.
+- :func:`auto_download_pa_providers` — best-effort startup auto-download.
+
+The downloader uses the public GitHub REST API
+(https://api.github.com/repos/<owner>/<repo>/contents/<path>?ref=<ref>)
+which does not require authentication for public repositories.  It respects
+the ``G4F_PROXY`` environment variable and is fully network-failure tolerant:
+any error is logged via :mod:`g4f.debug` and never raised, so a failed
+download can never break server startup.
+"""
+
+from __future__ import annotations
+
+import os
+import json
+import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from typing import List, Optional
+from urllib.request import Request, urlopen
+from urllib.error import URLError, HTTPError
+
+from .. import debug
+from .pa_provider import get_workspace_dir, list_pa_providers
+
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+#: Default GitHub repository (owner/repo) to download PA providers from.
+DEFAULT_REPO = "gpt4free/pa-providers"
+
+#: Default git ref (branch / tag / commit) to download from.
+DEFAULT_REF = "main"
+
+#: Public GitHub REST API root.
+GITHUB_API = "https://api.github.com"
+
+#: Per-request timeout (seconds) for GitHub API calls and raw downloads.
+DEFAULT_TIMEOUT: float = 30.0
+
+# Limit concurrent requests while keeping bulk downloads substantially faster.
+DOWNLOAD_WORKERS = 8
+
+#: Marker file written into the workspace after a successful auto-download.
+#: Its mtime is used to decide when the next auto-download is allowed, so we
+#: do not hit GitHub on every single server start.
+AUTO_DOWNLOAD_MARKER = ".pa_auto_downloaded"
+
+DELETED_FILE = ".deleted"
+
+#: Minimum seconds between two automatic downloads.
+AUTO_DOWNLOAD_INTERVAL: float = 6 * 60 * 60  # 6 hours
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _get_proxy() -> Optional[str]:
+    """Return the configured proxy URL, if any."""
+    return os.environ.get("G4F_PROXY") or os.environ.get("HTTPS_PROXY") or None
+
+
+def _github_request(
+    url: str, timeout: float, accept: str = "application/json"
+) -> bytes:
+    """Perform an HTTP GET against *url* and return the raw body bytes.
+
+    Raises:
+        URLError / HTTPError: on network or HTTP failure.
+    """
+    headers = {
+        "Accept": accept,
+        "User-Agent": "g4f-pa-downloader/1.0",
+    }
+    req = Request(url, headers=headers)
+    kwargs = {"timeout": timeout}
+    proxy = _get_proxy()
+    if proxy:
+        # urllib supports HTTPS proxies via environment variables only; set them
+        # for the duration of the call.
+        os.environ.setdefault("HTTPS_PROXY", proxy)
+        os.environ.setdefault("HTTP_PROXY", proxy)
+    return urlopen(req, **kwargs).read()
+
+
+def _is_pa_file(name: str) -> bool:
+    """Return ``True`` for PA provider / helper files.
+
+    Accepted: ``*.py``, ``*.wasm``, plus browser scripts named ``pa-*.js``
+    or ``*.pa.js``.
+    """
+    if name == DELETED_FILE:
+        return True
+    if name.startswith("test_"):
+        return False
+    if name.endswith(".py") or name.endswith(".wasm"):
+        return True
+    if name.endswith(".js"):
+        return name.startswith("pa-") or name.endswith(".pa.js")
+    return False
+
+
+def _list_repo_files(repo: str, ref: str, timeout: float) -> List[str]:
+    """Return the list of PA provider paths in the root of *repo* at *ref*.
+
+    Uses the GitHub contents API.  Subdirectories are not recursed — the
+    pa-providers repo is flat by convention.
+    """
+    url = f"{GITHUB_API}/repos/{repo}/contents/?ref={ref}"
+    body = _github_request(url, timeout, accept="application/vnd.github+json")
+    data = json.loads(body.decode("utf-8"))
+    if not isinstance(data, list):
+        return []
+    files: List[str] = []
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("name", "")
+        if _is_pa_file(name) and entry.get("type") == "file":
+            files.append(name)
+    return files
+
+
+def _download_raw(repo: str, ref: str, name: str, timeout: float) -> bytes:
+    """Download a single file's raw content from GitHub."""
+    url = f"https://raw.githubusercontent.com/{repo}/{ref}/{name}"
+    return _github_request(url, timeout, accept="text/plain")
+
+
+def _workspace_target(directory: Optional[str] = None) -> Path:
+    """Resolve the target workspace directory, creating it if needed."""
+    target = (
+        Path(directory).expanduser()
+        if directory
+        else (get_workspace_dir() / "pa-providers")
+    )
+    target.mkdir(parents=True, exist_ok=True)
+    return target
+
+
+def _read_deleted_manifest(target: Path) -> bytes:
+    """Return the local deletion manifest, or empty bytes if absent."""
+    try:
+        return (target / DELETED_FILE).read_bytes()
+    except OSError:
+        return b""
+
+
+def _remove_deleted_files(target: Path, content: bytes) -> None:
+    """Remove files named one-per-line in a deletion manifest."""
+    try:
+        names = content.decode("utf-8").splitlines()
+    except UnicodeDecodeError as e:
+        debug.error("pa-providers: invalid .deleted manifest:", e)
+        return
+
+    root = target.resolve()
+    for name in names:
+        name = name.strip()
+        if not name or name.startswith("#"):
+            continue
+        candidate = (target / name).resolve()
+        try:
+            candidate.relative_to(root)
+        except ValueError:
+            debug.error(f"pa-providers: refusing to delete outside workspace: {name}")
+            continue
+        if candidate == target / DELETED_FILE or not candidate.is_file():
+            continue
+        try:
+            candidate.unlink()
+            print(f"pa-providers: removed deleted file {name}")
+        except OSError as e:
+            debug.error(f"pa-providers: failed to remove deleted file {name}:", e)
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+
+def run_pa_download(
+    repo: str = DEFAULT_REPO,
+    ref: str = DEFAULT_REF,
+    force: bool = False,
+    timeout: float = DEFAULT_TIMEOUT,
+    directory: Optional[str] = None,
+    only: Optional[str] = None,
+) -> List[Path]:
+    """Download ``*.pa.py`` files from *repo*/*ref* into the workspace.
+
+    Args:
+        repo:  ``owner/repo`` GitHub repository (default: ``gpt4free/pa-providers``).
+        ref:   Branch / tag / commit (default: ``main``).
+        force: If ``True``, overwrite existing files.  If ``False``, only
+               download files that do not already exist locally.
+        timeout: Per-request timeout in seconds.
+        directory: Override target directory (default: the workspace
+                   directory, ``~/.g4f/workspace`` or ``$G4F_DIR``).
+        only: If given, download only this filename (e.g. ``koala.pa.py``).
+
+    Returns:
+        List of paths that were downloaded (and written) this call.
+    """
+    target = _workspace_target(directory)
+    written: List[Path] = []
+    deleted_manifest = _read_deleted_manifest(target)
+
+    try:
+        if only:
+            names = [only]
+        else:
+            names = _list_repo_files(repo, ref, timeout)
+            debug.log(f"pa-providers: found {len(names)} file(s) in {repo}@{ref}")
+    except (URLError, HTTPError, ValueError, OSError) as e:
+        debug.error(f"pa-providers: failed to list repository {repo}@{ref}:", e)
+        return written
+
+    pending = []
+    for name in names:
+        if not _is_pa_file(name):
+            continue
+        dest = target / name
+        if dest.exists() and not force:
+            debug.log(f"pa-providers: skip existing {name}")
+            continue
+        pending.append((name, dest))
+
+    total_size = 0
+
+    # Network requests run concurrently; handling results in submission order
+    # keeps output and the returned list stable for callers.
+    with ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS) as executor:
+        downloads = {
+            name: executor.submit(_download_raw, repo, ref, name, timeout)
+            for name, _ in pending
+        }
+        for name, dest in pending:
+            try:
+                content = downloads[name].result()
+            except (URLError, HTTPError, OSError) as e:
+                debug.error(f"pa-providers: failed to download {name}:", e)
+                continue
+            if name == DELETED_FILE:
+                deleted_manifest = content
+                continue
+            try:
+                dest.write_bytes(content)
+                written.append(dest)
+                total_size += len(content)
+            except OSError as e:
+                debug.error(f"pa-providers: failed to write {name}:", e)
+
+    _remove_deleted_files(target, deleted_manifest)
+
+    print(f"pa-providers: downloaded {len(written)} file(s) ({total_size/1e3} kb) from {repo}@{ref}")
+    if written:
+        # Touch the auto-download marker so the startup path does not re-download
+        # immediately after an explicit `g4f pa download`.
+        try:
+            with open(target / AUTO_DOWNLOAD_MARKER, "w") as f:
+                f.write(f"{time.time()}")
+        except OSError as e:
+            print(f"pa-providers: failed to touch auto-download marker: {e}")
+            pass
+
+    return written
+
+
+def run_pa_list(directory: Optional[str] = None) -> List[Path]:
+    """Print and return the list of installed PA providers."""
+    target = _workspace_target(directory)
+    _, pa_paths = list_pa_providers(target)
+    if not pa_paths:
+        print(f"No PA providers installed in {target}")
+        return []
+    print(f"PA providers in {target}:")
+    for p in pa_paths:
+        try:
+            rel = p.relative_to(target)
+        except ValueError:
+            rel = p
+        print(f"  - {rel}")
+    return pa_paths
+
+
+def run_pa_remove(filename: str, directory: Optional[str] = None) -> bool:
+    """Remove a PA provider by filename.  Returns ``True`` on success."""
+    if not filename:
+        print("Error: filename is required.")
+        return False
+    target = _workspace_target(directory)
+    # Resolve safely inside the workspace.
+    candidate = (target / filename).resolve()
+    try:
+        candidate.relative_to(target.resolve())
+    except ValueError:
+        print(f"Error: {filename} escapes the workspace directory.")
+        return False
+    if not candidate.name.endswith(".pa.py"):
+        print(f"Error: {filename} is not a .pa.py file.")
+        return False
+    if not candidate.exists():
+        print(f"Error: {filename} not found in {target}")
+        return False
+    try:
+        candidate.unlink()
+        print(f"Removed {candidate}")
+        return True
+    except OSError as e:
+        print(f"Error removing {filename}: {e}")
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Startup auto-download
+# ---------------------------------------------------------------------------
+
+
+def _should_auto_download(workspace: Path) -> bool:
+    """Return ``True`` if an automatic download should run now."""
+    marker = workspace / AUTO_DOWNLOAD_MARKER
+    if not marker.exists():
+        return True
+    try:
+        with open(marker, "r") as f:
+            timestamp = float(f.read().strip() or "0")
+        age = time.time() - timestamp
+    except OSError:
+        return True
+    return age >= AUTO_DOWNLOAD_INTERVAL
+
+
+def auto_download_pa_providers(
+    repo: str = DEFAULT_REPO,
+    ref: str = DEFAULT_REF,
+    timeout: float = DEFAULT_TIMEOUT,
+    force: bool = False,
+) -> List[Path]:
+    """Best-effort automatic download of PA providers.
+
+    Designed to be called from server startup.  Never raises — all errors are
+    logged via :mod:`g4f.debug` and swallowed so a network failure can never
+    prevent the server from starting.
+
+    When *force* is ``False`` (the default), the download is skipped if the
+    auto-download marker is fresher than :data:`AUTO_DOWNLOAD_INTERVAL`.
+    """
+    if os.environ.get("G4F_DISABLE_PA_AUTO_DOWNLOAD", "").lower() in ("1", "true", "yes"):
+        debug.log("pa-providers: auto-download explicitly disabled via G4F_DISABLE_PA_AUTO_DOWNLOAD")
+        return []
+
+    try:
+        workspace = get_workspace_dir()
+    except Exception as e:
+        debug.error("pa-providers: workspace unavailable, skipping auto-download:", e)
+        return []
+
+    if not force and not _should_auto_download(workspace):
+        debug.log("pa-providers: auto-download skipped (recent)")
+        return []
+
+    debug.log(f"pa-providers: auto-downloading from {repo}@{ref}")
+    try:
+        written = run_pa_download(repo=repo, ref=ref, force=True, timeout=timeout)
+    except Exception as e:
+        # run_pa_download already swallows most errors, but be defensive.
+        debug.error("pa-providers: auto-download failed:", e)
+        return []
+
+    if written:
+        pass
+    else:
+        debug.log("pa-providers: auto-download found nothing new to install")
+    return written

@@ -1,0 +1,49 @@
+"""
+Bootstrap the g4f Flask GUI server inside the Android app.
+
+MainActivity extracts the bundled g4f package and GUI assets from the APK
+into filesDir/app, then calls main(app_root, port) here. This module sets
+up the environment and runs the server on 127.0.0.1:<port>.
+"""
+from __future__ import annotations
+
+import os
+import sys
+
+
+def _log(*args):
+    print("[g4f-bootstrap]", *args, flush=True)
+
+
+def main(app_root: str, port: int, version: str | None = None) -> None:
+    _log("starting, app_root=", app_root, "port=", port)
+
+    # HOME must be writable for g4f config (~/.g4f). Chaquopy sets it to the
+    # app's internal storage dir already, but be defensive.
+    if "HOME" not in os.environ or not os.path.isdir(os.environ.get("HOME", "")):
+        os.environ["HOME"] = app_root
+
+    # Version injected from the git tag at build time (MainActivity reads the
+    # manifest versionName set by -PappVersionName / G4F_VERSION).
+    os.environ["G4F_VERSION"] = version or "0.1.0-android"
+    os.environ["G4F_API_HOST"] = "127.0.0.1"
+    os.environ["G4F_API_PORT"] = str(port)
+    # g4f.gui asks PyPI/GitHub for the latest version while rendering pages
+    # (and on every asset request when offline). Skip that lookup: it is
+    # pointless inside the app and used to stall the first paint.
+    os.environ["G4F_NO_VERSION_CHECK"] = "1"
+    # g4f resolves DIST_DIR relative to CWD: ./g4f.dev/dist
+    os.chdir(app_root)
+    if app_root not in sys.path:
+        sys.path.insert(0, app_root)
+
+    _log("importing g4f.gui ...")
+    import g4f.gui  # noqa: E402
+
+    _log("creating GUI app ...")
+    app = g4f.gui.get_gui_app()
+    app.debug = False
+
+    _log(f"serving on 127.0.0.1:{port}")
+    # Werkzeug dev server is fine for a local, single-user app.
+    app.run(host="127.0.0.1", port=port, debug=False, use_reloader=False, threaded=True)

@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>gpt4free Assistant</title>
+  <link rel="stylesheet" href="../assets/popup.css" />
+</head>
+<body>
+  <header class="popup-header">
+    <div class="brand">
+      <img src="../icons/icon32.png" alt="" width="20" height="20" />
+      <span class="brand-name">gpt4free</span>
+    </div>
+    <span id="health-dot" class="status-dot" title="Checking server…"></span>
+    <button id="open-panel" class="icon-btn" title="Open side panel (Alt+Shift+S)">▤</button>
+    <button id="open-options" class="icon-btn" title="Settings">⚙</button>
+  </header>
+
+  <section class="quick-actions" id="quick-actions">
+    <!-- quick action buttons injected -->
+  </section>
+
+  <section class="selection-box" id="selection-box" hidden>
+    <div class="selection-label">Selected text</div>
+    <div id="selection-text" class="selection-text"></div>
+    <button id="selection-use" class="btn-mini">Use in prompt</button>
+  </section>
+
+  <main id="messages" class="messages">
+    <div class="welcome">
+      <p>Quick chats here are handed off to the side panel, where they are saved in your conversation history.</p>
+    </div>
+  </main>
+
+  <footer class="popup-footer">
+    <textarea id="input" rows="2" placeholder="Ask anything… (Enter to send)"></textarea>
+    <div class="footer-row">
+      <span class="hint">Chats continue in the side panel</span>
+      <button id="stop" class="icon-btn stop" title="Stop" hidden>■</button>
+      <button id="send" class="primary-btn">Send</button>
+    </div>
+  </footer>
+
+  <div id="toast-root" class="toast-root"></div>
+  <script type="module" src="popup.js"></script>
+</body>
+</html>

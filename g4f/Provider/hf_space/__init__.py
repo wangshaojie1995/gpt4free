@@ -2,35 +2,29 @@ from __future__ import annotations
 
 import random
 
-from ...typing import AsyncResult, Messages, ImagesType
+from ...typing import AsyncResult, Messages, MediaListType
 from ...errors import ResponseError
 from ..base_provider import AsyncGeneratorProvider, ProviderModelMixin
 
-from .BlackForestLabsFlux1Dev        import BlackForestLabsFlux1Dev
-from .BlackForestLabsFlux1Schnell    import BlackForestLabsFlux1Schnell
-from .VoodoohopFlux1Schnell          import VoodoohopFlux1Schnell
-from .CohereForAI                    import CohereForAI
-from .Janus_Pro_7B                   import Janus_Pro_7B
-from .Qwen_QVQ_72B                   import Qwen_QVQ_72B
-from .Qwen_Qwen_2_5M_Demo            import Qwen_Qwen_2_5M_Demo
-from .Qwen_Qwen_2_72B_Instruct       import Qwen_Qwen_2_72B_Instruct
-from .StableDiffusion35Large         import StableDiffusion35Large
+from .BlackForestLabs_Flux1Dev import BlackForestLabs_Flux1Dev
+from .BlackForestLabs_Flux1KontextDev import BlackForestLabs_Flux1KontextDev
+from .CohereForAI_C4AI_Command import CohereForAI_C4AI_Command
+from .StabilityAI_SD35Large import StabilityAI_SD35Large
+
 
 class HuggingSpace(AsyncGeneratorProvider, ProviderModelMixin):
     url = "https://huggingface.co/spaces"
-    parent = "HuggingFace"
-
     working = True
+    active_by_default = True
 
-    default_model = Qwen_Qwen_2_72B_Instruct.default_model
-    default_image_model = BlackForestLabsFlux1Dev.default_model
-    default_vision_model = Qwen_QVQ_72B.default_model
+    default_model = CohereForAI_C4AI_Command.default_model
+    default_image_model = BlackForestLabs_Flux1Dev.default_model
+    default_vision_model = None
     providers = [
-        BlackForestLabsFlux1Dev, BlackForestLabsFlux1Schnell,
-        VoodoohopFlux1Schnell,
-        CohereForAI, Janus_Pro_7B,
-        Qwen_QVQ_72B, Qwen_Qwen_2_5M_Demo, Qwen_Qwen_2_72B_Instruct,
-        StableDiffusion35Large
+        BlackForestLabs_Flux1Dev,
+        BlackForestLabs_Flux1KontextDev,
+        CohereForAI_C4AI_Command,
+        StabilityAI_SD35Large,
     ]
 
     @classmethod
@@ -46,11 +40,18 @@ class HuggingSpace(AsyncGeneratorProvider, ProviderModelMixin):
             models = []
             image_models = []
             vision_models = []
+            cls.model_aliases = {}
             for provider in cls.providers:
                 models.extend(provider.get_models(**kwargs))
-                models.extend(provider.model_aliases.keys())
+                models.extend(
+                    []
+                    if provider.model_aliases is None
+                    else provider.model_aliases.keys()
+                )
                 image_models.extend(provider.image_models)
                 vision_models.extend(provider.vision_models)
+                if provider.model_aliases is not None:
+                    cls.model_aliases.update(provider.model_aliases)
             models = list(set(models))
             models.sort()
             cls.models = models
@@ -60,31 +61,28 @@ class HuggingSpace(AsyncGeneratorProvider, ProviderModelMixin):
 
     @classmethod
     async def create_async_generator(
-        cls, model: str, messages: Messages, images: ImagesType = None, **kwargs
+        cls, model: str, messages: Messages, media: MediaListType = None, **kwargs
     ) -> AsyncResult:
-        if not model and images is not None:
-            model = cls.default_vision_model
+        if not model:
+            model = cls.default_vision_model if media is not None else cls.default_model
         is_started = False
         random.shuffle(cls.providers)
         for provider in cls.providers:
-            if model in provider.model_aliases:
-                async for chunk in provider.create_async_generator(provider.model_aliases[model], messages, **kwargs):
+            if model in (getattr(provider, "model_aliases", {}) or {}) or model in provider.get_models():
+                alias = (
+                    provider.model_aliases[model]
+                    if model in (getattr(provider, "model_aliases", {}) or {})
+                    else model
+                )
+                async for chunk in provider.create_async_generator(
+                    alias, messages, media=media, **kwargs
+                ):
                     is_started = True
                     yield chunk
             if is_started:
                 return
-        error = None
-        for provider in cls.providers:
-            if model in provider.get_models():
-                try:
-                    async for chunk in provider.create_async_generator(model, messages, **kwargs):
-                        is_started = True
-                        yield chunk
-                    if is_started:
-                        break
-                except ResponseError as e:
-                    if is_started:
-                        raise e
-                    error = e
-        if not is_started and error is not None:
-            raise error
+
+
+for provider in HuggingSpace.providers:
+    provider.parent = HuggingSpace.__name__
+    provider.hf_space = True

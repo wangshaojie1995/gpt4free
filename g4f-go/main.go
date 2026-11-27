@@ -1,0 +1,383 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"strings"
+	"syscall"
+	"time"
+
+	"g4f-go/freeflow"
+	"g4f-go/polli"
+	"g4f-go/sandbox"
+)
+
+// printHelp shows the g4f-go usage.
+func printHelp() {
+	fmt.Printf(`g4f-go %s - gpt4free with a downloaded CPython %s runtime
+
+Usage:
+  g4f-go <g4f args...>        run gpt4free (e.g. g4f-go client "hello")
+  g4f-go -m <module> [args...] run a bundled Python module
+  g4f-go script.py [args...]  run a .py file with the bundled Python
+  g4f-go api --port 8080      start the OpenAI-compatible API server
+  g4f-go gui                  launch the web GUI
+  g4f-go status               show runtime download/install status
+  g4f-go browser install      install the headless browser (Lightpanda) for this OS
+  g4f-go browser serve        run the browser's CDP server in the foreground
+  g4f-go sandbox [command]    run the g4f sandbox container (g4f-sandbox)
+  g4f-go start-desktop-sandbox [--app TOOL] [options]  start the desktop sandbox
+  g4f-go sandbox --desktop connect        open a shell in the desktop sandbox
+  g4f-go sandbox --desktop exec <cmd...>  run a command in the desktop sandbox
+  g4f-go sandbox-cli [args]   run sandbox-cli in the desktop container
+  g4f-go polli-sandbox        create a Polli cloud sandbox with g4f-go + sandbox-cli
+  g4f-go freeflow             run the pi-freeflow proxy without Pi/OMP
+  g4f-go freeflow status      show the standalone freeflow endpoint and API key
+  g4f-go freeflow install     install/update the pi-freeflow npm package
+  g4f-go turn serve           run the embedded STUN/TURN relay (pion/turn)
+  g4f-go turn status          show the embedded STUN/TURN relay
+  g4f-go turn credentials     mint TURN REST credentials for a client
+  g4f-go cache clear          remove all cached g4f data (model lists, scrape caches)
+  g4f-go install g4f         (re)install the g4f package (network)
+  g4f-go install             install the g4f-go launcher into a bin on PATH
+  g4f-go install --prefix DIR  install the launcher into DIR
+  g4f-go upgrade              upgrade the g4f package to the latest release
+  g4f-go update               update the g4f-go launcher itself
+  g4f-go uninstall            remove g4f-go, its runtime, browser and caches
+  g4f-go bootstrap            refresh the g4f package installation
+  g4f-go -v <version> <cmd>   pin the g4f package version (e.g. g4f-go -v 1.5.0 api)
+  g4f-go -v latest            stop pinning (track the latest g4f release)
+  g4f-go --version            print version
+  g4f-go help                 show this help
+
+Bundled modules (g4f-go -m <module>):
+  remote_desktop              remote desktop server (web UI, QR pairing)
+
+  g4f-go -m remote_desktop --port 8000
+
+The CPython runtime downloads on first run (with progress feedback) into
+%s. Set G4F_PYTHON_ONLY=1 to print the interpreter path and exit.
+`, Version, PythonVer, installDir())
+}
+
+func main() {
+	os.Exit(runMain())
+}
+
+func runMain() int {
+	binDir := installDir()
+	args := os.Args[1:]
+	if len(args) == 0 {
+		printHelp()
+		return 0
+	}
+
+	// `-v <version>` pins the g4f package version. Strip it here so the pin
+	// works in front of any subcommand; a bare `-v` still prints the
+	// g4f-go version (handled by the switch below).
+	pin, pinExplicit, args := g4fPin(binDir, args)
+	if len(args) == 0 {
+		// `g4f-go -v <version>` without a command: make sure that exact
+		// g4f version is installed.
+		return runPinOnly(binDir, pin)
+	}
+
+	// `browser` manages the headless browser itself and needs no Python runtime.
+	if args[0] == "browser" {
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		return runBrowserCommand(ctx, args[1:])
+	}
+
+	// `turn` runs the embedded STUN/TURN relay and needs no Python runtime.
+	if args[0] == "turn" {
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		return runTurnCommand(ctx, args[1:])
+	}
+
+	// `sandbox` and `sandbox-cli` drive the sandbox container and need no
+	// Python runtime either. `g4f-sandbox` is accepted as an alias so users
+	// can type the standalone launcher's name.
+	if args[0] == "sandbox" || args[0] == "g4f-sandbox" {
+		return sandbox.Run(args[1:])
+	}
+	if args[0] == "start-desktop-sandbox" {
+		return sandbox.Run(desktopSandboxArgs(args[1:]))
+	}
+	if args[0] == "sandbox-cli" {
+		return sandbox.RunCLI(args[1:])
+	}
+
+	// `polli-sandbox` installs Polli, creates a hosted E2B sandbox and sets up
+	// g4f-go + sandbox-cli there. It needs no Python runtime either.
+	if args[0] == "polli-sandbox" || args[0] == "polli" || args[0] == "sandbox-polli" {
+		return polli.Run(args[1:])
+	}
+
+	// `freeflow` installs and runs the pi-freeflow proxy on its own, without
+	// the Pi/OMP host (and without the Python runtime).
+	if args[0] == "freeflow" || args[0] == "pi-freeflow" {
+		return freeflow.Run(args[1:])
+	}
+
+	// `install` without a package installs the launcher itself into a bin
+	// directory on PATH. `install g4f ...` stays a pip passthrough below.
+	if args[0] == "install" && launcherSelfInstall(args[1:]) {
+		return runInstallCommand(args[1:])
+	}
+
+	// `update` replaces the launcher itself and `uninstall` removes the
+	// launcher plus its managed data. Neither needs the Python runtime.
+	// `uninstall <package>` stays a pip passthrough (handled below).
+	if args[0] == "update" {
+		return runUpdateCommand(args[1:])
+	}
+	if args[0] == "uninstall" && (len(args) == 1 || args[1] == "help" || strings.HasPrefix(args[1], "-")) {
+		return runUninstallCommand(args[1:])
+	}
+
+	py, err := ensureRuntime()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "g4f-go:", err)
+		os.Exit(1)
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	// `-m <module>` runs a Python module. Modules shipped inside the binary
+	// (see bundle.go) are extracted into the runtime and run from there;
+	// anything else is forwarded to the interpreter as-is.
+	if moduleFlagNeedsValue(args) {
+		fmt.Fprintln(os.Stderr, "g4f-go: -m/--module requires a module name")
+		return 2
+	}
+	if module, rest := parseModuleFlag(args); module != "" {
+		if isBundledModule(module) {
+			return runBundledModule(ctx, binDir, py, module, rest)
+		}
+		code, err := runPython(ctx, py, append([]string{"-m", module}, rest...))
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "g4f-go:", err)
+		}
+		return code
+	}
+
+	switch args[0] {
+	case "help", "--help", "-h":
+		printHelp()
+		return 0
+	case "--version", "-v":
+		fmt.Printf("g4f-go %s (CPython %s)\n", Version, PythonVer)
+		return 0
+	}
+
+	switch args[0] {
+	case "cache":
+		return runCacheCommand(args[1:])
+	case "status":
+		stamp := filepath.Join(binDir, ".g4f-runtime", ".installed")
+		fmt.Printf("binary dir: %s\n", binDir)
+		fmt.Printf("python:     %s\n", py)
+		if _, serr := os.Stat(py); serr == nil {
+			fmt.Println("runtime:    downloaded & extracted")
+		} else {
+			fmt.Println("runtime:    not downloaded yet (will download on first run)")
+		}
+		if _, serr := os.Stat(stamp); serr == nil {
+			if builtinG4F(binDir) {
+				fmt.Println("g4f:        installed (builtin/local checkout)")
+			} else {
+				fmt.Println("g4f:        installed")
+			}
+		} else {
+			fmt.Println("g4f:        not installed (will install on first run)")
+		}
+		if pin != "" {
+			fmt.Printf("g4f pin:    %s (.g4f-runtime/.g4f-version)\n", pin)
+		} else {
+			fmt.Println("g4f pin:    none (tracking the latest release)")
+		}
+		if data, berr := os.ReadFile(bundleStampPath(binDir)); berr == nil {
+			fmt.Printf("bundle:     revision %s extracted (%s)\n", strings.TrimSpace(string(data)), bundleDir(binDir))
+		} else {
+			fmt.Println("bundle:     not extracted yet (extracts on first -m use)")
+		}
+		if exe, berr := installedBrowserBinary(); berr == nil {
+			fmt.Printf("browser:    %s\n", exe)
+		} else {
+			fmt.Println("browser:    not installed (run: g4f-go browser install)")
+		}
+		code, err := runPython(ctx, py, []string{"--version"})
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "g4f-go:", err)
+		}
+		return code
+	case "upgrade":
+		return runUpgradeCommand(binDir, py, pin, pinExplicit)
+	case "install", "uninstall":
+		if len(args) < 2 {
+			fmt.Fprintln(os.Stderr, "usage: g4f-go install g4f")
+		}
+		code, err := runPython(ctx, py, append([]string{"-m", "pip"}, args...), pipEnv(binDir)...)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "g4f-go:", err)
+		}
+		if code == 0 {
+			// Keep the -v pin in sync with an explicit pip passthrough
+			// (`install g4f` unpins, `install g4f==X.Y.Z` pins).
+			syncPinWithInstallSpec(binDir, args)
+			// An editable checkout (`install -e /path`) is the image's own
+			// g4f: record it so api/gui never replace it with PyPI's latest.
+			if isEditableG4FInstall(args) {
+				if merr := markBuiltinG4F(binDir); merr != nil {
+					fmt.Fprintln(os.Stderr, "g4f-go: recording builtin g4f:", merr)
+				}
+			}
+		}
+		return code
+	case "bootstrap":
+		// Refresh the embedded package installation (e.g. after updating g4f-go).
+		code, err := runPython(ctx, py, []string{"-m", "pip", "install", "--no-input", g4fSpec(pin)}, pipEnv(binDir)...)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "g4f-go:", err)
+		}
+		if code == 0 {
+			// bootstrap installs g4f from PyPI, replacing a builtin checkout.
+			clearBuiltinG4F(binDir)
+		}
+		return code
+	}
+
+	if os.Getenv("G4F_PYTHON_ONLY") == "1" {
+		fmt.Println(py)
+		return 0
+	}
+
+	// When g4f will run headless, make sure a CDP browser is available: start
+	// the installed Lightpanda and point g4f at it.
+	extraEnv, stopBrowser := browserAutoStartEnv(args)
+	if stopBrowser != nil {
+		defer stopBrowser()
+	}
+
+	// If the first argument is a .py file, run it directly with the bundled
+	// Python interpreter (forwarding any remaining args to the script).
+	if strings.HasSuffix(args[0], ".py") {
+		if _, serr := os.Stat(args[0]); serr != nil {
+			fmt.Fprintln(os.Stderr, "g4f-go:", serr)
+			return 1
+		}
+		code, err := runPython(ctx, py, args, extraEnv...)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "g4f-go:", err)
+		}
+		return code
+	}
+
+	if err := ensureG4FPackage(binDir, py, args, pin); err != nil {
+		fmt.Fprintln(os.Stderr, "g4f-go:", err)
+	}
+
+	// Default: forward everything to the g4f module.
+	code, err := runPython(ctx, py, append([]string{"-m", "g4f"}, args...), extraEnv...)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "g4f-go:", err)
+	}
+	return code
+}
+
+// desktopSandboxArgs keeps the normal sandbox options available for the
+// desktop shortcut, while selecting the desktop image regardless of the
+// caller's G4F_SANDBOX_MODE setting.
+func desktopSandboxArgs(args []string) []string {
+	return append(append([]string{"up"}, args...), "--desktop")
+}
+
+// runPinOnly handles `g4f-go -v <version>` with no command: make sure the
+// pinned g4f version is installed and report the effective pin.
+func runPinOnly(binDir, pin string) int {
+	py, err := ensureRuntime()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "g4f-go:", err)
+		return 1
+	}
+	if err := ensureG4FPackage(binDir, py, nil, pin); err != nil {
+		fmt.Fprintln(os.Stderr, "g4f-go:", err)
+		return 1
+	}
+	if pin != "" {
+		fmt.Printf("g4f pinned to %s\n", pin)
+	} else {
+		fmt.Println("g4f version pin cleared (tracking the latest release)")
+	}
+	return 0
+}
+
+// ensureG4FPackage handles first-install, pin enforcement and selected
+// auto-upgrade flows for the g4f package inside the prepared runtime. A
+// non-empty pin (from -v or a previous run) installs exactly that version;
+// a pinned install never auto-upgrades.
+func ensureG4FPackage(binDir, py string, args []string, pin string) error {
+	// On Termux we use the system python (no downloaded runtime), so skip
+	// the downloaded-runtime g4f install/upgrade logic that targets
+	// binDir/python-home.
+	if IsTermuxSystem() {
+		return nil
+	}
+	if needsInstall(binDir, pin) {
+		// First call, or the pin changed: (re)install g4f.
+		start := time.Now()
+		return installG4F(binDir, py, pin, start)
+	}
+	if pin == "" && builtinG4F(binDir) {
+		// The runtime holds a local/editable g4f (sandbox image). Never
+		// replace it with the latest PyPI release on api/gui runs.
+		return nil
+	}
+	if pin == "" && len(args) > 0 && isUpgradeCommand(args[0]) {
+		// Subsequent call with gui/api/dev: upgrade g4f. Skipped while a
+		// version is pinned — pinning means "stay on this version".
+		start := time.Now()
+		return upgradeG4F(binDir, py, start)
+	}
+	return nil
+}
+
+// normalizeArgs cleans leading `g4f-go` repeats (typos like `g4f-go g4f-go ...`).
+func normalizeArgs(args []string) []string {
+	for len(args) > 0 {
+		args = args[1:]
+	}
+	// A leading binary-name echo (e.g. argv[0]) is stripped by callers.
+	return args
+}
+
+// isUpgradeCommand reports whether the subcommand should trigger an
+// automatic g4f upgrade (only when g4f is already installed).
+func isUpgradeCommand(arg string) bool {
+	switch arg {
+	case "api", "gui":
+		return true
+	}
+	return false
+}
+
+// hasSubcommand reports whether args start with a known g4f-go subcommand.
+func hasSubcommand(args []string) bool {
+	if len(args) == 0 {
+		return true
+	}
+	switch args[0] {
+	case "help", "--help", "-h", "--version", "-v", "status", "install", "upgrade", "update", "uninstall", "bootstrap", "cache", "browser", "turn", "sandbox", "g4f-sandbox", "start-desktop-sandbox", "sandbox-cli", "polli-sandbox", "polli", "sandbox-polli":
+		return true
+	}
+	if strings.HasPrefix(args[0], "-") {
+		return true
+	}
+	return false
+}

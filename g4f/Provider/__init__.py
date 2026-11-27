@@ -1,67 +1,410 @@
 from __future__ import annotations
 
-from ..providers.types          import BaseProvider, ProviderType
-from ..providers.retry_provider import RetryProvider, IterListProvider
-from ..providers.base_provider  import AsyncProvider, AsyncGeneratorProvider
-from ..providers.create_images  import CreateImagesProvider
+import types, importlib, threading
 
-from .deprecated       import *
-from .needs_auth       import *
-from .not_working      import *
-from .local            import *
-from .hf               import HuggingFace, HuggingChat, HuggingFaceAPI, HuggingFaceInference
-from .hf_space         import HuggingSpace
-from .mini_max         import HailuoAI, MiniMax
-from .template         import OpenaiTemplate, BackendApi
+from ..providers.types import BaseProvider, ProviderType
+from ..providers.retry_provider import RetryProvider, IterListProvider, RotatedProvider, ProviderCircuitBreaker
+from ..providers.base_provider import AsyncProvider, AsyncGeneratorProvider
+from ..providers.create_images import CreateImagesProvider
+from .. import debug
 
-from .Blackbox             import Blackbox
-from .BlackboxAPI          import BlackboxAPI
-from .CablyAI              import CablyAI
-from .ChatGLM              import ChatGLM
-from .ChatGpt              import ChatGpt
-from .ChatGptEs            import ChatGptEs
-from .ChatGptt             import ChatGptt
-from .Cloudflare           import Cloudflare
-from .Copilot              import Copilot
-from .DDG                  import DDG
-from .DeepInfraChat        import DeepInfraChat
-from .Free2GPT             import Free2GPT
-from .FreeGpt              import FreeGpt
-from .GizAI                import GizAI
-from .Glider               import Glider
-from .ImageLabs            import ImageLabs
-from .Jmuz                 import Jmuz
-from .Liaobots             import Liaobots
-from .Mhystical            import Mhystical
-from .OIVSCode             import OIVSCode
-from .PerplexityLabs       import PerplexityLabs
-from .Pi                   import Pi
-from .Pizzagpt             import Pizzagpt
-from .PollinationsAI       import PollinationsAI
-from .PollinationsImage    import PollinationsImage
-from .Prodia               import Prodia
-from .TeachAnything        import TeachAnything
-from .You                  import You
-from .Yqcloud              import Yqcloud
-
-import sys
-
-__modules__: list = [
-    getattr(sys.modules[__name__], provider) for provider in dir()
-    if not provider.startswith("__")
+__others__ = [
+    "AnyProvider",
+    "BaseProvider",
+    "ProviderType",
+    "RetryProvider",
+    "IterListProvider",
+    "RotatedProvider",
+    "ProviderCircuitBreaker",
+    "AsyncProvider",
+    "AsyncGeneratorProvider",
+    "CreateImagesProvider",
+    "ProviderUtils",
+    "ProviderLoader",
 ]
-__providers__: list[ProviderType] = [
-    provider for provider in __modules__
-    if isinstance(provider, type)
-    and issubclass(provider, BaseProvider)
-]
-__providers__ = __providers__ + HuggingSpace.providers
-__all__: list[str] = [
-    provider.__name__ for provider in __providers__
-]
-__map__: dict[str, ProviderType] = dict([
-    (provider.__name__, provider) for provider in __providers__
-])
+
+class ProviderLoader:
+    names = [
+        "Antigravity",
+        "AgentTools",
+        "Airforce",
+        "BingCreateImages",
+        "BraveSearch",
+        "BlackForestLabs_Flux1Dev",
+        "BlackForestLabs_Flux1KontextDev",
+        "BlackboxPro",
+        "CachedSearch",
+        "Cerebras",
+        "Claude",
+        "Cloudflare",
+        "CohereForAI_C4AI_Command",
+        "Copilot",
+        "DeepInfra",
+        "DeepSeek",
+        "EdgeTTS",
+        "ElevenLabs",
+        "G4FSpace",
+        "GLM",
+        "Gemini",
+        "GeminiCLI",
+        "GeminiPro",
+        "GithubCopilot",
+        "GoogleAiMode",
+        "GoogleSearch",
+        "Grok",
+        "Groq",
+        "HailuoAI",
+        "HuggingChat",
+        "HuggingFace",
+        "HuggingFaceMedia",
+        "HuggingSpace",
+        "Arena",
+        "Local",
+        "MarkItDown",
+        "MetaAI",
+        "MetaAIAccount",
+        "MicrosoftDesigner",
+        "Nvidia",
+        "RelayRouter",
+        "KiloCode",
+        "LLM7",
+        "Ollama",
+        "OmniRoute",
+        "PiFreeflow",
+        "OpenaiAccount",
+        "OpenAIFM",
+        "OpenRouterFree",
+        "ChatGPT",
+        "OperaAria",
+        "Perplexity",
+        "Pi",
+        "Pollinations",
+        "PollinationsAudio",
+        "PollinationsImage",
+        "Puter",
+        "Qwen",
+        "QwenCode",
+        "SearXNG",
+        "StabilityAI_SD35Large",
+        "TeachAnything",
+        "WhiteRabbitNeo",
+        "You",
+        "YouTube",
+        "Yqcloud",
+        "gTTS",
+    ]
+    extra = [
+        "APIRoute",
+        "OpenaiTemplate",
+        "OrcaRouter",
+        "AIBadgr",
+        "Anthropic",
+        "GigaChat",
+        "GithubCopilotAPI",
+        "CheaperInference",
+        "MiniMax",
+        "OpenaiAPI",
+        "Cohere",
+        "OpenRouter",
+        "PerplexityApi",
+        "PhindAi",
+        "Replicate",
+        "ThebApi",
+        "Together",
+        "xAI",
+    ]
+    loaded = {}
+    ignored = []
+    # Importing provider modules is expensive (dozens of imports and several
+    # seconds on a cold interpreter).  The GUI issues provider/model requests
+    # concurrently, so serialize cache misses instead of loading the same
+    # module several times in parallel.
+    _load_lock = threading.RLock()
+    _providers_cache = None
+    _providers_cache_key = None
+    _lower_names = None
+
+    @classmethod
+    def _name_map(cls) -> dict:
+        """Return a cached ``normalized name -> canonical name`` mapping."""
+        if cls._lower_names is None:
+            cls._lower_names = {
+                name.lower().replace("-", "").replace("_", ""): name
+                for name in cls.names
+            }
+        return cls._lower_names
+
+    @classmethod
+    def _get_loaded(cls, name: str, norm_name: str) -> ProviderType:
+        provider = cls.loaded.get(name)
+        if provider is None:
+            provider = cls.loaded.get(norm_name)
+        return provider
+
+    @classmethod
+    def from_name(cls, name: str) -> ProviderType:
+        if not name or not isinstance(name, str):
+            return None
+        norm_name = name.lower().replace("-", "").replace("_", "")
+        provider = cls._get_loaded(name, norm_name)
+        if provider is not None:
+            return provider
+        with cls._load_lock:
+            # Another thread may have populated the cache while we waited.
+            provider = cls._get_loaded(name, norm_name)
+            if provider is not None:
+                return provider
+            try:
+                provider = cls._load(name)
+                cls.loaded[name] = provider
+                cls.loaded[norm_name] = provider
+                return provider
+            except ImportError:
+                if norm_name in ("agent", "agenttools", "agent_tools"):
+                    actual_name = "AgentTools"
+                elif norm_name == "freeflow":
+                    actual_name = "PiFreeflow"
+                else:
+                    actual_name = cls._name_map().get(norm_name)
+                if actual_name and actual_name != name:
+                    provider = cls._load(actual_name)
+                    cls.loaded[name] = provider
+                    cls.loaded[norm_name] = provider
+                    return provider
+                raise ImportError(f"Provider not found: {name}")
+
+    @classmethod
+    def all(cls) -> list:
+        """Return every non-ignored provider, loading the list only once.
+
+        ``g4f.Provider.__providers__`` is used by the GUI and the API on every
+        provider listing.  Re-walking ``names`` (and importing each provider)
+        for every request dominated cold-start latency, so the result is
+        cached and only rebuilt when ``ProviderLoader.ignored`` changes.
+        """
+        cache_key = tuple(cls.ignored)
+        if cls._providers_cache is not None and cls._providers_cache_key == cache_key:
+            return cls._providers_cache
+        with cls._load_lock:
+            if cls._providers_cache is not None and cls._providers_cache_key == cache_key:
+                return cls._providers_cache
+            providers_list = []
+            for provider_name in cls.names:
+                if provider_name in cls.ignored:
+                    continue
+                try:
+                    providers_list.append(cls.from_name(provider_name))
+                except ImportError:
+                    pass
+            cls._providers_cache = providers_list
+            cls._providers_cache_key = cache_key
+            return providers_list
+
+    @classmethod
+    def _load(cls, name: str) -> ProviderType:
+        debug.log(f"Loading provider: {name}")
+        if name in ["AnyProvider", "Default", "default"]:
+            from g4f.providers.any_provider import AnyProvider
+
+            return AnyProvider
+        elif name == "G4FSpace":
+            from ..client.factory import AbstractClientFactory
+            cls.loaded[name] = AbstractClientFactory.create_provider(
+                None, "default"
+            )
+            cls.loaded[name].__name__ = name
+            cls.loaded[name].url = "https://g4f.dev"
+            cls.loaded[name].active_by_default = True
+            return cls.loaded[name]
+        try:
+            if name in ["HuggingFace", "HuggingFaceMedia", "HuggingChat"]:
+                module = "needs_auth.hf"
+            elif name in ["HuggingSpace"]:
+                module = "hf_space"
+            elif name in ["QwenCode"]:
+                module = "qwen.QwenCode"
+            elif name in ["GithubCopilot"]:
+                module = "github.GithubCopilot"
+            elif name in ["MiniMax", "HailuoAI"]:
+                module = "needs_auth.mini_max"
+            elif name in ["OpenaiChat", "ChatGPT"]:
+                name = "ChatGPT"
+                module = "ChatGPT"
+            else:
+                module = name
+            module = importlib.import_module(f"g4f.Provider.{module}")
+            if hasattr(module, name):
+                return getattr(module, name)
+        except ImportError:
+            pass
+        for submodule in ["needs_auth", "search", "local", "audio", "extra", "hf_space"]:
+            try:
+                module = importlib.import_module(f"g4f.Provider.{submodule}.{name}")
+                if hasattr(module, name):
+                    return getattr(module, name)
+            except ImportError:
+                pass
+        if name == "GLM":
+            from g4f.Provider.glm import GLM
+
+            return GLM
+        elif name == "RelayRouter":
+            from ..client.factory import AbstractClientFactory
+            cls.loaded[name] = AbstractClientFactory.create_provider(
+                None, "custom:srv_mt1wbaxgf9c946af0c58", 
+            )
+            cls.loaded[name].__name__ = name
+            cls.loaded[name].url = "https://relayrouter.org"
+            cls.loaded[name].active_by_default = True
+            return cls.loaded[name]
+        elif name == "KiloCode":
+            from ..client.factory import AbstractClientFactory
+            cls.loaded[name] = AbstractClientFactory.create_provider(
+                None, "https://api.kilo.ai/api/gateway"
+            )
+            cls.loaded[name].__name__ = name
+            cls.loaded[name].url = "https://kilo.ai"
+            cls.loaded[name].active_by_default = True
+            cls.loaded[name].default_model = "kilo-auto/free"
+            return cls.loaded[name]
+        elif name == "LLM7":
+            from ..client.factory import AbstractClientFactory
+            cls.loaded[name] = AbstractClientFactory.create_provider(
+                None, "https://api.llm7.io/v1"
+            )
+            cls.loaded[name].__name__ = name
+            cls.loaded[name].url = "https://llm7.io"
+            cls.loaded[name].active_by_default = True
+            cls.loaded[name].default_model = "default"
+            cls.loaded[name].models = ["default"]
+            cls.loaded[name].add_user = False
+            return cls.loaded[name]
+        elif name == "OrcaRouter":
+            from ..client.factory import AbstractClientFactory
+            cls.loaded[name] = AbstractClientFactory.create_provider(
+                name, "https://api.orcarouter.ai/v1"
+            )
+            cls.loaded[name].__name__ = name
+            cls.loaded[name].url = "https://orcarouter.ai"
+            return cls.loaded[name]
+        elif name in ("AgentTools", "agent-tools", "agent_tools", "agent"):
+            from g4f.Provider.AgentTools import AgentTools
+
+            return AgentTools
+        elif name == "OpenaiTemplate":
+            from g4f.Provider.template.OpenaiTemplate import OpenaiTemplate
+
+            return OpenaiTemplate
+        else:
+            norm_name = name.lower().replace("-", "").replace("_", "")
+            if norm_name == "agent":
+                return cls.from_name("AgentTools")
+            lower_map = cls._name_map()
+            if norm_name in lower_map and lower_map[norm_name] != name:
+                return cls.from_name(lower_map[norm_name])
+            raise ImportError(f"Provider '{name}' not found")
+
+__all__ = __others__ + ProviderLoader.names + ProviderLoader.extra
+
+def __getattr__(name: str):
+    if name == "__providers__":
+        # Load all providers if specifically requested (cached afterwards).
+        return ProviderLoader.all()
+    value = globals().get(name)
+    # Importing a provider submodule (e.g. g4f.Provider.ChatGPT) sets the
+    # module object as a package attribute, shadowing the provider class of
+    # the same name.  Prefer the class from ProviderLoader so callers always
+    # get a provider, and fall back to the module only if it is not a provider.
+    if value is not None and not isinstance(value, types.ModuleType):
+        return value
+    try:
+        return ProviderLoader.from_name(name)
+    except ImportError as e:
+        if value is not None:
+            return value
+        raise AttributeError(f"module '{__name__}' has no attribute '{name}'") from e
+
+
+def __dir__():
+    return __all__
+
+
+class _ConvertDict(dict):
+    def _normalize(self, name: str) -> str:
+        return name.lower().replace("-", "").replace("_", "")
+
+    def __contains__(self, item):
+        if not isinstance(item, str):
+            return False
+        try:
+            return ProviderLoader.from_name(item) is not None
+        except Exception:
+            return False
+
+    def __getitem__(self, item):
+        try:
+            return ProviderLoader.from_name(item)
+        except Exception as e:
+            raise KeyError(f"Provider '{item}' not found") from e
+
+    def keys(self):
+        return ProviderLoader.names
+
+    def items(self):
+        return [(k, self[k]) for k in ProviderLoader.names]
+
+    def get(self, item, default=None):
+        try:
+            return self[item]
+        except KeyError:
+            return default
+
+
+__map__ = _ConvertDict()
+
 
 class ProviderUtils:
-    convert: dict[str, ProviderType] = __map__
+    convert = __map__
+
+    @classmethod
+    def get_by_label(cls, label: str) -> ProviderType:
+        if not label:
+            raise ValueError("Label must be provided")
+
+        # Check explicit map
+        try:
+            return ProviderLoader.from_name(label)
+        except ImportError:
+            pass
+
+        # Fallback to search
+        for provider_name in ProviderLoader.names:
+            if provider_name.lower().startswith(label.lower()):
+                try:
+                    provider = ProviderLoader.from_name(provider_name)
+                    if provider.working:
+                        return provider
+                except ImportError:
+                    pass
+
+        raise ValueError(f"Provider with label '{label}' not found")
+
+
+import sys
+import types
+
+
+class LazyProviderModule(types.ModuleType):
+    def __getattribute__(self, name):
+        if name.startswith("__"):
+            return super().__getattribute__(name)
+
+        try:
+            return __getattr__(name)
+        except AttributeError:
+            pass
+
+        return super().__getattribute__(name)
+
+
+sys.modules[__name__].__class__ = LazyProviderModule

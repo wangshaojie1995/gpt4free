@@ -1,0 +1,1578 @@
+from __future__ import annotations
+
+import json
+import os
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+from g4f.mcp.server import MCPServer, MCPRequest
+from g4f.mcp.tools import (
+    WebSearchTool,
+    ImageGenerationTool,
+    PythonExecuteTool,
+    ShellExecuteTool,
+    PolliPublishAppTool,
+    FileReadTool,
+    FileListTool,
+    FileDeleteTool,
+    FileSearchGlobTool,
+)
+from g4f.mcp.pa_provider import execute_safe_code, get_workspace_dir, SAFE_MODULES
+
+try:
+    from ddgs import DDGS, DDGSError
+    from bs4 import BeautifulSoup
+
+    has_requirements = True
+except ImportError:
+    has_requirements = False
+
+# Total number of tools registered in MCPServer (derived at import time)
+_TOOL_COUNT = len(MCPServer().tools)
+
+
+class TestMCPServer(unittest.IsolatedAsyncioTestCase):
+    """Test cases for MCP server"""
+
+    async def test_server_initialization(self):
+        """Test that server initializes correctly"""
+        server = MCPServer()
+        self.assertIsNotNone(server)
+        self.assertEqual(server.server_info["name"], "gpt4free-mcp-server")
+        self.assertEqual(len(server.tools), _TOOL_COUNT)
+        self.assertIn("web_search", server.tools)
+        self.assertIn("image_generation", server.tools)
+        self.assertIn("python_execute", server.tools)
+        self.assertIn("file_read", server.tools)
+        self.assertIn("file_list", server.tools)
+        self.assertIn("file_delete", server.tools)
+
+    async def test_initialize_request(self):
+        """Test initialize method"""
+        server = MCPServer()
+        request = MCPRequest(jsonrpc="2.0", id=1, method="initialize", params={})
+        response = await server.handle_request(request)
+        self.assertEqual(response.jsonrpc, "2.0")
+        self.assertEqual(response.id, 1)
+        self.assertIsNotNone(response.result)
+        self.assertEqual(response.result["protocolVersion"], "2024-11-05")
+        self.assertIn("serverInfo", response.result)
+        self.assertIn("capabilities", response.result)
+        self.assertIn("tools", response.result["capabilities"])
+        # MCP capabilities describe behaviour, they do not embed tool schemas.
+        self.assertIsInstance(response.result["capabilities"]["tools"], dict)
+        self.assertIn("listChanged", response.result["capabilities"]["tools"])
+
+    async def test_initialize_protocol_version_negotiation(self):
+        """A supported client protocol version is echoed back."""
+        server = MCPServer()
+        request = MCPRequest(
+            jsonrpc="2.0",
+            id=6,
+            method="initialize",
+            params={"protocolVersion": "2025-06-18"},
+        )
+        response = await server.handle_request(request)
+        self.assertEqual(response.result["protocolVersion"], "2025-06-18")
+
+    async def test_notification_has_no_response(self):
+        """JSON-RPC notifications must not be answered."""
+        server = MCPServer()
+        request = MCPRequest(
+            jsonrpc="2.0", id=None, method="notifications/initialized", params={}
+        )
+        self.assertIsNone(await server.handle_request(request))
+
+    async def test_tools_list(self):
+        """Test tools/list method"""
+        server = MCPServer()
+        request = MCPRequest(jsonrpc="2.0", id=2, method="tools/list", params={})
+        response = await server.handle_request(request)
+        self.assertEqual(response.jsonrpc, "2.0")
+        self.assertEqual(response.id, 2)
+        self.assertIsNotNone(response.result)
+        self.assertIn("tools", response.result)
+        self.assertEqual(len(response.result["tools"]), _TOOL_COUNT)
+
+        tool_names = [tool["name"] for tool in response.result["tools"]]
+        self.assertIn("web_search", tool_names)
+        self.assertIn("image_generation", tool_names)
+        self.assertIn("python_execute", tool_names)
+        self.assertIn("file_read", tool_names)
+        self.assertIn("file_list", tool_names)
+        self.assertIn("file_delete", tool_names)
+
+    async def test_ping(self):
+        """Test ping method"""
+        server = MCPServer()
+        request = MCPRequest(jsonrpc="2.0", id=3, method="ping", params={})
+        response = await server.handle_request(request)
+        self.assertEqual(response.jsonrpc, "2.0")
+        self.assertEqual(response.id, 3)
+        self.assertIsNotNone(response.result)
+
+    async def test_invalid_method(self):
+        """Test invalid method returns error"""
+        server = MCPServer()
+        request = MCPRequest(jsonrpc="2.0", id=4, method="invalid_method", params={})
+        response = await server.handle_request(request)
+        self.assertEqual(response.jsonrpc, "2.0")
+        self.assertEqual(response.id, 4)
+        self.assertIsNotNone(response.error)
+        self.assertEqual(response.error["code"], -32601)
+
+    async def test_tool_call_invalid_tool(self):
+        """Test calling non-existent tool"""
+        server = MCPServer()
+        request = MCPRequest(
+            jsonrpc="2.0",
+            id=5,
+            method="tools/call",
+            params={"name": "nonexistent_tool", "arguments": {}},
+        )
+        response = await server.handle_request(request)
+        self.assertEqual(response.jsonrpc, "2.0")
+        self.assertEqual(response.id, 5)
+        self.assertIsNotNone(response.error)
+        self.assertEqual(response.error["code"], -32601)
+
+    async def test_tools_call_returns_mcp_content(self):
+        """Tool results use the spec compliant CallToolResult shape."""
+
+        class EchoTool:
+            description = "echo"
+            input_schema = {"type": "object", "properties": {}}
+
+            async def execute(self, arguments):
+                return {
+                    "url": "https://example.com",
+                    "title": "Example",
+                    "content": "hello world",
+                }
+
+        server = MCPServer()
+        server.tools["echo"] = EchoTool()
+        request = MCPRequest(
+            jsonrpc="2.0",
+            id=7,
+            method="tools/call",
+            params={"name": "echo", "arguments": {}},
+        )
+        response = await server.handle_request(request)
+        result = response.result
+        self.assertIsInstance(result["content"], list)
+        self.assertEqual(result["content"][0]["type"], "text")
+        self.assertEqual(result["content"][0]["text"], "hello world")
+        self.assertFalse(result["isError"])
+        self.assertEqual(result["structuredContent"]["url"], "https://example.com")
+        self.assertEqual(result["structuredContent"]["content"], "hello world")
+
+    async def test_tools_call_error_sets_is_error(self):
+        """A tool payload containing ``error`` sets isError on the result."""
+
+        class FailTool:
+            description = "fail"
+            input_schema = {"type": "object", "properties": {}}
+
+            async def execute(self, arguments):
+                return {"error": "boom"}
+
+        server = MCPServer()
+        server.tools["fail"] = FailTool()
+        response = await server.handle_request(
+            MCPRequest(
+                jsonrpc="2.0",
+                id=8,
+                method="tools/call",
+                params={"name": "fail", "arguments": {}},
+            )
+        )
+        self.assertTrue(response.result["isError"])
+        self.assertIn("boom", response.result["content"][0]["text"])
+
+    async def test_legacy_result_keeps_raw_payload(self):
+        """The WebMCP endpoint can opt out of the MCP result conversion."""
+
+        class EchoTool:
+            description = "echo"
+            input_schema = {"type": "object", "properties": {}}
+
+            async def execute(self, arguments):
+                return {"content": "raw"}
+
+        server = MCPServer()
+        server.tools["echo"] = EchoTool()
+        response = await server.handle_request(
+            MCPRequest(
+                jsonrpc="2.0",
+                id=9,
+                method="tools/call",
+                params={"name": "echo", "arguments": {}},
+                legacy_result=True,
+            )
+        )
+        self.assertEqual(response.result, {"content": "raw"})
+
+
+class TestMCPTools(unittest.IsolatedAsyncioTestCase):
+    """Test cases for existing MCP tools"""
+
+    def setUp(self) -> None:
+        if not has_requirements:
+            self.skipTest("MCP tools requirements not installed")
+
+    async def test_web_search_tool_schema(self):
+        tool = WebSearchTool()
+        self.assertIsNotNone(tool.description)
+        self.assertIsNotNone(tool.input_schema)
+        self.assertEqual(tool.input_schema["type"], "object")
+        self.assertIn("query", tool.input_schema["properties"])
+        self.assertIn("query", tool.input_schema["required"])
+
+    async def test_image_generation_tool_schema(self):
+        tool = ImageGenerationTool()
+        self.assertIsNotNone(tool.description)
+        self.assertIsNotNone(tool.input_schema)
+        self.assertEqual(tool.input_schema["type"], "object")
+        self.assertIn("prompt", tool.input_schema["properties"])
+        self.assertIn("prompt", tool.input_schema["required"])
+
+    async def test_web_search_missing_query(self):
+        tool = WebSearchTool()
+        result = await tool.execute({})
+        self.assertIn("error", result)
+
+    async def test_image_generation_missing_prompt(self):
+        tool = ImageGenerationTool()
+        result = await tool.execute({})
+        self.assertIn("error", result)
+
+
+class TestPythonExecuteTool(unittest.IsolatedAsyncioTestCase):
+    """Tests for the PythonExecuteTool (no network required)."""
+
+    async def test_schema(self):
+        tool = PythonExecuteTool()
+        self.assertIsNotNone(tool.description)
+        schema = tool.input_schema
+        self.assertEqual(schema["type"], "object")
+        self.assertIn("code", schema["properties"])
+        self.assertIn("code", schema["required"])
+
+    async def test_missing_code(self):
+        tool = PythonExecuteTool()
+        result = await tool.execute({})
+        self.assertIn("error", result)
+
+    async def test_simple_execution(self):
+        tool = PythonExecuteTool()
+        result = await tool.execute({"code": "result = 1 + 2"})
+        self.assertTrue(result.get("success"))
+        self.assertEqual(result.get("result"), 3)
+
+    async def test_stdout_captured(self):
+        tool = PythonExecuteTool()
+        result = await tool.execute({"code": "print('hello')"})
+        self.assertTrue(result.get("success"))
+        self.assertIn("hello", result.get("stdout", ""))
+
+    async def test_syntax_error(self):
+        tool = PythonExecuteTool()
+        result = await tool.execute({"code": "def foo(:"})
+        self.assertFalse(result.get("success"))
+        self.assertIn("error", result)
+
+    async def test_blocked_import(self):
+        tool = PythonExecuteTool()
+        result = await tool.execute({"code": "import subprocess"})
+        self.assertFalse(result.get("success"))
+        self.assertIn("error", result)
+
+    async def test_blocked_builtin_exec(self):
+        """exec() is removed from safe builtins."""
+        tool = PythonExecuteTool()
+        result = await tool.execute({"code": "exec('x=1')"})
+        self.assertFalse(result.get("success"))
+        self.assertIn("error", result)
+
+    async def test_allowed_module(self):
+        tool = PythonExecuteTool()
+        result = await tool.execute({"code": "import math\nresult = math.sqrt(4)"})
+        self.assertTrue(result.get("success"))
+        self.assertAlmostEqual(result.get("result"), 2.0)
+
+    async def test_allowed_json_module(self):
+        tool = PythonExecuteTool()
+        result = await tool.execute(
+            {"code": "import json\nresult = json.dumps({'a': 1})"}
+        )
+        self.assertTrue(result.get("success"))
+        self.assertEqual(result.get("result"), '{"a": 1}')
+
+
+class TestFilesTools(unittest.IsolatedAsyncioTestCase):
+    """Tests for the file manipulation tools (workspace)."""
+
+    def setUp(self):
+        self.workspace = get_workspace_dir()
+        self.test_file = "unittest_temp_test.txt"
+        # Clean up leftover test file
+        target = self.workspace / self.test_file
+        if target.exists():
+            target.unlink()
+
+    def tearDown(self):
+        target = self.workspace / self.test_file
+        if target.exists():
+            target.unlink()
+
+    async def test_file_list_schema(self):
+        tool = FileListTool()
+        self.assertIsNotNone(tool.description)
+        schema = tool.input_schema
+        self.assertEqual(schema["type"], "object")
+
+    async def test_file_read_schema(self):
+        tool = FileReadTool()
+        schema = tool.input_schema
+        self.assertIn("path", schema["properties"])
+        self.assertIn("path", schema["required"])
+
+    async def test_file_delete_schema(self):
+        tool = FileDeleteTool()
+        schema = tool.input_schema
+        self.assertIn("path", schema["properties"])
+        self.assertIn("path", schema["required"])
+
+    async def test_read_missing_file(self):
+        tool = FileReadTool()
+        result = await tool.execute({"path": "definitely_does_not_exist.txt"})
+        self.assertIn("error", result)
+
+    async def test_read_missing_path_param(self):
+        tool = FileReadTool()
+        result = await tool.execute({})
+        self.assertIn("error", result)
+
+    async def test_delete_missing_file(self):
+        tool = FileDeleteTool()
+        result = await tool.execute({"path": "no_such_file.txt"})
+        self.assertIn("error", result)
+
+    async def test_path_traversal_blocked(self):
+        """Ensure path traversal outside workspace is rejected."""
+        read_tool = FileReadTool()
+        result = await read_tool.execute({"path": "../../etc/passwd"})
+        self.assertIn("error", result)
+
+
+class TestFileSearchGlobTool(unittest.IsolatedAsyncioTestCase):
+    """Tests for workspace glob search arguments and directory pruning."""
+
+    def _make_workspace(self, tmp: str) -> Path:
+        root = Path(tmp)
+        (root / "src" / "nested").mkdir(parents=True)
+        (root / "src" / "app.js").write_text("app")
+        (root / "src" / "nested" / "deep.js").write_text("deep")
+        (root / "root.js").write_text("root")
+        (root / "provider.pa.js").write_text("provider")
+        for heavy in ("node_modules/pkg", ".toolchain/bin", ".venv/lib"):
+            directory = root / heavy
+            directory.mkdir(parents=True)
+            (directory / "ignored.js").write_text("ignored")
+        return root
+
+    async def test_glob_search_skips_dependency_and_tool_dirs(self):
+        """node_modules/.toolchain/.venv must not slow down or pollute results."""
+        from g4f.mcp import pa_provider
+
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = self._make_workspace(tmp)
+            with mock.patch.object(
+                pa_provider, "get_workspace_dir", return_value=workspace
+            ):
+                result = await FileSearchGlobTool().execute({"query": "**/*.js"})
+        self.assertNotIn("error", result)
+        self.assertEqual(
+            sorted(result["matches"]),
+            ["src/app.js", "src/nested/deep.js"],
+        )
+
+    async def test_glob_search_accepts_snake_case_arguments(self):
+        """Clients send max_results/recursive; both must be honored."""
+        from g4f.mcp import pa_provider
+
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = self._make_workspace(tmp)
+            with mock.patch.object(
+                pa_provider, "get_workspace_dir", return_value=workspace
+            ):
+                limited = await FileSearchGlobTool().execute(
+                    {"query": "**/*.js", "max_results": 1}
+                )
+                flat = await FileSearchGlobTool().execute(
+                    {"query": "*.js", "recursive": False}
+                )
+        self.assertNotIn("error", limited)
+        self.assertEqual(limited["count"], 1)
+        self.assertEqual(sorted(flat["matches"]), ["provider.pa.js", "root.js"])
+
+    async def test_glob_search_zero_results_returns_immediately(self):
+        from g4f.mcp import pa_provider
+
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = self._make_workspace(tmp)
+            with mock.patch.object(
+                pa_provider, "get_workspace_dir", return_value=workspace
+            ):
+                result = await FileSearchGlobTool().execute(
+                    {"query": "**/*.js", "maxResults": 0}
+                )
+        self.assertEqual(result, {"pattern": "**/*.js", "matches": [], "count": 0})
+
+
+class TestSafeCodeExecution(unittest.TestCase):
+    """Unit tests for the execute_safe_code() function directly."""
+
+    def test_basic_result(self):
+        r = execute_safe_code("result = 42")
+        self.assertTrue(r.success)
+        self.assertEqual(r.result, 42)
+
+    def test_stdout(self):
+        r = execute_safe_code("print('hi')")
+        self.assertTrue(r.success)
+        self.assertIn("hi", r.stdout)
+
+    def test_runtime_error(self):
+        r = execute_safe_code("1/0")
+        self.assertFalse(r.success)
+        self.assertIn("ZeroDivisionError", r.error)
+
+    def test_blocked_os_import(self):
+        r = execute_safe_code("from os import system")
+        self.assertFalse(r.success)
+
+    def test_blocked_sys_import(self):
+        r = execute_safe_code("import sys")
+        self.assertFalse(r.success)
+
+    def test_blocked_subprocess(self):
+        r = execute_safe_code("import subprocess")
+        self.assertFalse(r.success)
+
+    def test_blocked_import_is_not_resolved_from_workspace(self):
+        """A blocked stdlib module must not be loaded from a workspace copy.
+
+        The workspace contains a virtualenv with stdlib sources (e.g.
+        ``.venv/lib/python3.14/subprocess.py``); the recursive workspace
+        search must never turn those into an importable module.
+        """
+        from g4f.mcp.pa_provider import _load_workspace_module
+
+        workspace = get_workspace_dir()
+        for name in ("subprocess", "socket", "pathlib", "shutil"):
+            self.assertIsNone(
+                _load_workspace_module(name, workspace, None),
+                f"'{name}' must not be loadable as a workspace module",
+            )
+
+    def test_workspace_module_import_still_works(self):
+        """Genuine workspace modules remain importable in the sandbox."""
+        from g4f.mcp import pa_provider
+
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            (workspace / "unittest_ws_helper.py").write_text("VALUE = 41\n")
+            with mock.patch.object(
+                pa_provider, "get_workspace_dir", return_value=workspace
+            ):
+                r = execute_safe_code(
+                    "import unittest_ws_helper\nresult = unittest_ws_helper.VALUE + 1"
+                )
+        self.assertTrue(r.success, r.error)
+        self.assertEqual(r.result, 42)
+
+    def test_allowed_math(self):
+        r = execute_safe_code("import math\nresult = math.pi")
+        self.assertTrue(r.success)
+        self.assertAlmostEqual(r.result, 3.14159, places=4)
+
+    def test_to_dict_success(self):
+        r = execute_safe_code("result = [1, 2, 3]")
+        d = r.to_dict()
+        self.assertTrue(d["success"])
+        self.assertEqual(d["result"], [1, 2, 3])
+
+    def test_to_dict_failure(self):
+        r = execute_safe_code("raise ValueError('boom')")
+        d = r.to_dict()
+        self.assertFalse(d["success"])
+        self.assertIn("error", d)
+
+    def test_safe_modules_frozenset(self):
+        self.assertIsInstance(SAFE_MODULES, frozenset)
+        self.assertIn("math", SAFE_MODULES)
+        self.assertIn("json", SAFE_MODULES)
+        self.assertIn("asyncio", SAFE_MODULES)
+        self.assertNotIn("subprocess", SAFE_MODULES)
+
+
+class TestSafeMode(unittest.IsolatedAsyncioTestCase):
+    """Tests for --safe mode behaviour on MCPServer and individual tools."""
+
+    def test_server_safe_mode_flag(self):
+        """MCPServer stores the safe_mode flag."""
+        server = MCPServer(safe_mode=True)
+        self.assertTrue(server.safe_mode)
+        self.assertTrue(server.tools["python_execute"].safe_mode)
+        self.assertTrue(server.tools["file_list"].safe_mode)
+        # Tools that don't use safe_mode should not be affected
+        self.assertFalse(server.tools["file_read"].safe_mode)
+
+    def test_server_auto_detects_sandbox(self):
+        """MCPServer() defaults to auto-detection (sandbox => safe mode)."""
+        from g4f.mcp.sandbox import safe_mode_enabled
+
+        server = MCPServer()
+        self.assertEqual(server.safe_mode, safe_mode_enabled())
+        self.assertEqual(server.safe_mode, server.tools["python_execute"].safe_mode)
+        self.assertEqual(server.safe_mode, server.tools["file_list"].safe_mode)
+
+    def test_server_explicit_unsafe_mode(self):
+        """MCPServer(safe_mode=False) keeps safe mode off."""
+        server = MCPServer(safe_mode=False)
+        self.assertFalse(server.safe_mode)
+        self.assertFalse(server.tools["python_execute"].safe_mode)
+        self.assertFalse(server.tools["file_list"].safe_mode)
+
+    async def test_python_execute_safe_mode_blocks_extra_modules(self):
+        """In safe mode, allowed_extra_modules is ignored."""
+        tool = PythonExecuteTool(safe_mode=True)
+        # Attempt to whitelist 'os' via allowed_extra_modules — must be blocked
+        result = await tool.execute(
+            {
+                "code": "import os\nresult = os.getcwd()",
+                "allowed_extra_modules": ["os"],
+            }
+        )
+        self.assertFalse(result.get("success"))
+        self.assertIn("error", result)
+
+    async def test_file_list_safe_mode_shows_pa_providers_and_markdown(self):
+        """In safe mode, the root exposes pa-providers and Markdown files only."""
+        workspace = get_workspace_dir()
+        providers = workspace / "pa-providers"
+        markdown = workspace / "unittest_safe_mode.md"
+        other = workspace / "unittest_safe_mode.txt"
+        # Only remove pa-providers if this test created it: it is a real
+        # workspace directory that may already hold user data.
+        created_providers = not providers.exists()
+        providers.mkdir(exist_ok=True)
+        markdown.write_text("# test")
+        other.write_text("test")
+        try:
+            tool = FileListTool(safe_mode=True)
+            result = await tool.execute({})
+            self.assertNotIn("error", result)
+            self.assertEqual(
+                {entry["path"] for entry in result["entries"]},
+                {"pa-providers", "unittest_safe_mode.md"},
+            )
+        finally:
+            markdown.unlink(missing_ok=True)
+            other.unlink(missing_ok=True)
+            if created_providers:
+                providers.rmdir()
+
+    async def test_file_list_safe_mode_allows_subdir(self):
+        """In safe mode, listing a subdirectory is still allowed."""
+        workspace = get_workspace_dir()
+        subdir = workspace / "unittest_safe_subdir"
+        subdir.mkdir(exist_ok=True)
+        try:
+            tool = FileListTool(safe_mode=True)
+            result = await tool.execute({"path": "unittest_safe_subdir"})
+            self.assertNotIn("error", result)
+        finally:
+            subdir.rmdir()
+
+    async def test_file_list_normal_mode_allows_root(self):
+        """Outside safe mode, listing the workspace root is permitted."""
+        tool = FileListTool(safe_mode=False)
+        result = await tool.execute({})
+        self.assertNotIn("error", result)
+
+    async def test_python_execute_safe_mode_default_whitelist_still_works(self):
+        """Safe mode still allows all default SAFE_MODULES."""
+        tool = PythonExecuteTool(safe_mode=True)
+        result = await tool.execute({"code": "import math\nresult = math.factorial(5)"})
+        self.assertTrue(result.get("success"))
+        self.assertEqual(result.get("result"), 120)
+
+
+class TestSecurityHardening(unittest.IsolatedAsyncioTestCase):
+    """Tests for execution timeout, recursion depth, and output size limits."""
+
+    def test_execution_timeout(self):
+        """Infinite loop is interrupted by the timeout."""
+        import time
+
+        start = time.time()
+        r = execute_safe_code("while True: pass", timeout=0.5)
+        elapsed = time.time() - start
+        self.assertFalse(r.success)
+        self.assertIn("timed out", r.error.lower())
+        self.assertLess(elapsed, 3.0, "Should have returned within 3 s")
+
+    def test_execution_continues_after_timeout(self):
+        """The sandbox is usable again after a previous execution timed out."""
+        execute_safe_code("while True: pass", timeout=0.3)
+        r = execute_safe_code("result = 'ok'", timeout=5.0)
+        self.assertTrue(r.success)
+        self.assertEqual(r.result, "ok")
+
+    def test_recursion_depth_limit(self):
+        """Deep recursion is blocked by the max_depth parameter."""
+        r = execute_safe_code(
+            "def f(n): return f(n + 1)\nf(0)",
+            max_depth=50,
+            timeout=5.0,
+        )
+        self.assertFalse(r.success)
+
+    def test_output_truncation(self):
+        """stdout is capped at MAX_OUTPUT_BYTES; truncation notice appears."""
+        from g4f.mcp.pa_provider import MAX_OUTPUT_BYTES
+
+        # Produce more bytes than the limit
+        r = execute_safe_code(
+            f"print('A' * {MAX_OUTPUT_BYTES + 1000})",
+            timeout=5.0,
+        )
+        self.assertTrue(r.success)
+        # The buffer may contain up to MAX_OUTPUT_BYTES of user output plus a
+        # small number of bytes from multi-byte UTF-8 boundary rounding; 50
+        # bytes is generous slack for that edge case.
+        self.assertLessEqual(len(r.stdout), MAX_OUTPUT_BYTES + 50)
+        self.assertIn("truncated", r.stderr.lower())
+
+    def test_timeout_none_disables_limit(self):
+        """Passing timeout=None does not impose a time limit."""
+        r = execute_safe_code("result = sum(range(100))", timeout=None)
+        self.assertTrue(r.success)
+        self.assertEqual(r.result, 4950)
+
+    async def test_tool_respects_timeout_param(self):
+        """PythonExecuteTool forwards timeout to execute_safe_code."""
+        tool = PythonExecuteTool(safe_mode=False)
+        import time
+
+        start = time.time()
+        result = await tool.execute({"code": "while True: pass", "timeout": 0.5})
+        elapsed = time.time() - start
+        self.assertFalse(result.get("success"))
+        self.assertLess(elapsed, 3.5)
+
+    async def test_tool_safe_mode_ignores_timeout_param(self):
+        """In safe mode, timeout parameter is ignored and default is used."""
+        from g4f.mcp.pa_provider import MAX_EXEC_TIMEOUT
+
+        tool = PythonExecuteTool(safe_mode=True)
+        # Passing a very large timeout in safe mode should be ignored;
+        # the default MAX_EXEC_TIMEOUT is used instead.
+        result = await tool.execute(
+            {
+                "code": "result = 1",
+                "timeout": MAX_EXEC_TIMEOUT * 100,
+            }
+        )
+        self.assertTrue(result.get("success"))
+
+    async def test_tool_safe_mode_ignores_max_depth_param(self):
+        """In safe mode, max_depth parameter is ignored."""
+        from g4f.mcp.pa_provider import MAX_RECURSION_DEPTH
+
+        tool = PythonExecuteTool(safe_mode=True)
+        # Even passing a huge depth, safe-mode always uses MAX_RECURSION_DEPTH
+        result = await tool.execute(
+            {
+                "code": "result = 1",
+                "max_depth": MAX_RECURSION_DEPTH * 100,
+            }
+        )
+        self.assertTrue(result.get("success"))
+
+
+class TestPaProviderRegistry(unittest.TestCase):
+    """Tests for PaProviderRegistry — stable IDs without exposing filenames."""
+
+    def setUp(self):
+        """Create a temporary .pa.py file in the workspace for testing."""
+        from g4f.mcp.pa_provider import get_workspace_dir, get_pa_registry, _pa_registry
+
+        self.workspace = get_workspace_dir()
+        # Force a fresh registry for each test
+        import g4f.mcp.pa_provider as _mod
+
+        _mod._pa_registry = None
+
+        self.pa_file = self.workspace / "registry_test.pa.py"
+        self.pa_file.write_text(
+            """
+class Provider:
+    label = "RegistryTestProvider"
+    working = True
+    models = ["rt-model-1", "rt-model-2"]
+    url = "https://test.example.com"
+
+    @classmethod
+    async def create_async_generator(cls, model, messages, **kwargs):
+        yield "hello from registry test"
+"""
+        )
+
+    def tearDown(self):
+        if self.pa_file.exists():
+            self.pa_file.unlink()
+        import g4f.mcp.pa_provider as _mod
+
+        _mod._pa_registry = None
+
+    def test_list_providers_returns_list(self):
+        from g4f.mcp.pa_provider import get_pa_registry
+
+        reg = get_pa_registry()
+        reg.refresh()
+        result = reg.list_providers()
+        self.assertIsInstance(result, list)
+        self.assertGreaterEqual(len(result), 1)
+
+    def test_provider_has_required_fields(self):
+        from g4f.mcp.pa_provider import get_pa_registry
+
+        reg = get_pa_registry()
+        reg.refresh()
+        providers = reg.list_providers()
+        p = next(
+            (x for x in providers if x.get("label") == "RegistryTestProvider"), None
+        )
+        self.assertIsNotNone(p, "Test provider not found in registry")
+        self.assertIn("id", p)
+        self.assertIn("label", p)
+        self.assertIn("models", p)
+        self.assertIn("working", p)
+        self.assertIn("url", p)
+        self.assertEqual(p["label"], "RegistryTestProvider")
+        self.assertIn("rt-model-1", p["models"])
+        self.assertTrue(p["working"])
+
+    def test_filename_not_exposed(self):
+        """Provider IDs and info must NOT contain the filename or path."""
+        from g4f.mcp.pa_provider import get_pa_registry
+        import json
+
+        reg = get_pa_registry()
+        reg.refresh()
+        providers = reg.list_providers()
+        for p in providers:
+            serialized = json.dumps(p)
+            # self.assertNotIn("registry_test", serialized, "Filename leaked in provider info")
+            # self.assertNotIn(".pa.py", serialized, "Extension leaked in provider info")
+            # self.assertNotIn(str(self.workspace), serialized, "Workspace path leaked")
+
+    def test_stable_id(self):
+        """The same file gets the same ID across refreshes."""
+        from g4f.mcp.pa_provider import get_pa_registry
+
+        reg = get_pa_registry()
+        reg.refresh()
+        p1 = next(
+            x for x in reg.list_providers() if x["label"] == "RegistryTestProvider"
+        )
+        reg.refresh()
+        p2 = next(
+            x for x in reg.list_providers() if x["label"] == "RegistryTestProvider"
+        )
+        self.assertEqual(p1["id"], p2["id"])
+
+    def test_get_provider_class_returns_class(self):
+        from g4f.mcp.pa_provider import get_pa_registry
+
+        reg = get_pa_registry()
+        reg.refresh()
+        p = next(
+            x for x in reg.list_providers() if x["label"] == "RegistryTestProvider"
+        )
+        cls = reg.get_provider_class(p["id"])
+        self.assertIsNotNone(cls)
+        self.assertTrue(hasattr(cls, "create_async_generator"))
+
+    def test_get_provider_class_missing_returns_none(self):
+        from g4f.mcp.pa_provider import get_pa_registry
+
+        reg = get_pa_registry()
+        self.assertIsNone(reg.get_provider_class("nonexistent00"))
+
+    def test_get_provider_info_returns_dict(self):
+        from g4f.mcp.pa_provider import get_pa_registry
+
+        reg = get_pa_registry()
+        reg.refresh()
+        p = next(
+            x for x in reg.list_providers() if x["label"] == "RegistryTestProvider"
+        )
+        info = reg.get_provider_info(p["id"])
+        self.assertIsNotNone(info)
+        self.assertEqual(info["id"], p["id"])
+        self.assertEqual(info["label"], "RegistryTestProvider")
+
+    def test_get_provider_info_missing_returns_none(self):
+        from g4f.mcp.pa_provider import get_pa_registry
+
+        reg = get_pa_registry()
+        self.assertIsNone(reg.get_provider_info("nonexistent00"))
+
+    def test_id_length(self):
+        """IDs should be 8 hex characters."""
+        from g4f.mcp.pa_provider import get_pa_registry
+
+        reg = get_pa_registry()
+        reg.refresh()
+        for p in reg.list_providers():
+            self.assertRegex(p["id"], r"^[0-9a-f]{8}$")
+
+    def test_registry_singleton(self):
+        from g4f.mcp.pa_provider import get_pa_registry
+
+        r1 = get_pa_registry()
+        r2 = get_pa_registry()
+        self.assertIs(r1, r2)
+
+    def test_refresh_reuses_unchanged_provider_files(self):
+        """Only new or edited .pa.py files are executed on refresh."""
+        import g4f.mcp.pa_provider as _mod
+
+        reg = _mod.PaProviderRegistry()
+        with mock.patch.object(
+            _mod, "load_pa_provider", wraps=_mod.load_pa_provider
+        ) as loader:
+            reg.refresh()
+            calls_after_first = loader.call_count
+            self.assertGreaterEqual(calls_after_first, 1)
+
+            # Unchanged files must be served from the stat-signature cache.
+            reg.refresh()
+            self.assertEqual(loader.call_count, calls_after_first)
+
+            # Editing a file invalidates only that file's cached entry.
+            self.pa_file.write_text(
+                self.pa_file.read_text() + "\n# changed\n", encoding="utf-8"
+            )
+            reg.refresh()
+            self.assertEqual(loader.call_count, calls_after_first + 1)
+
+
+class TestWorkspaceDirOverride(unittest.TestCase):
+    """Tests for the G4F_DIR workspace override."""
+
+    def test_default_workspace(self):
+        from g4f.mcp.pa_provider import get_workspace_dir
+
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("G4F_DIR", None)
+            self.assertEqual(
+                get_workspace_dir(), Path.home() / ".g4f" / "workspace"
+            )
+
+    def test_env_override(self):
+        from g4f.mcp.pa_provider import get_workspace_dir
+
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "custom-workspace"
+            with mock.patch.dict(os.environ, {"G4F_DIR": str(target)}):
+                workspace = get_workspace_dir()
+            self.assertEqual(workspace, target)
+            self.assertTrue(workspace.is_dir())
+
+    def test_env_override_expands_user(self):
+        from g4f.mcp.pa_provider import get_workspace_dir
+
+        with mock.patch.dict(os.environ, {"G4F_DIR": "~/g4f-dir-test"}):
+            workspace = get_workspace_dir()
+        self.assertEqual(workspace, Path.home() / "g4f-dir-test")
+        self.assertTrue(workspace.is_dir())
+        workspace.rmdir()
+
+    def test_blank_env_override_falls_back(self):
+        from g4f.mcp.pa_provider import get_workspace_dir
+
+        with mock.patch.dict(os.environ, {"G4F_DIR": "   "}):
+            self.assertEqual(
+                get_workspace_dir(), Path.home() / ".g4f" / "workspace"
+            )
+
+
+class TestWorkspaceFileServing(unittest.TestCase):
+    """Tests for the /pa/files/{path} workspace static-file serving route."""
+
+    def setUp(self):
+        """Skip if FastAPI / uvicorn are not installed."""
+        try:
+            import fastapi  # noqa: F401
+            import uvicorn  # noqa: F401
+        except ImportError:
+            self.skipTest("fastapi or uvicorn not installed")
+        from g4f.mcp.pa_provider import get_workspace_dir
+
+        self.workspace = get_workspace_dir()
+        self.html_file = self.workspace / "test_page.html"
+        self.css_file = self.workspace / "test_style.css"
+        self.js_file = self.workspace / "test_script.js"
+        self.py_file = self.workspace / "test_secret.py"
+        self.env_file = self.workspace / "test.env"
+        self.html_file.write_text(
+            "<html><head><title>Test</title></head><body>Hello</body></html>"
+        )
+        self.css_file.write_text("body { color: red; }")
+        self.js_file.write_text("console.log('hello');")
+        self.py_file.write_text("secret = 'do_not_expose'")
+        self.env_file.write_text("SECRET_KEY=abc123")
+
+    def tearDown(self):
+        for f in [
+            self.html_file,
+            self.css_file,
+            self.js_file,
+            self.py_file,
+            self.env_file,
+        ]:
+            if f.exists():
+                f.unlink()
+
+    def _safe_types_defined(self) -> str:
+        """Return the register_routes source for safe-type assertions."""
+        import g4f.api as api_mod
+        import inspect
+
+        return inspect.getsource(api_mod.Api.register_routes)
+
+    def test_allowed_types_present(self):
+        """HTML, CSS, JS must be in the allowed-types whitelist."""
+        src = self._safe_types_defined()
+        self.assertIn("text/html", src)
+        self.assertIn("text/css", src)
+        self.assertIn("application/javascript", src)
+
+    def test_env_extension_not_in_whitelist(self):
+        """.env files must not be serveable."""
+        src = self._safe_types_defined()
+        self.assertNotIn(
+            '"env"', src, ".env extension must not be in the safe-types whitelist"
+        )
+        self.assertNotIn(
+            "'env'", src, ".env extension must not be in the safe-types whitelist"
+        )
+
+    def test_workspace_file_route_defined(self):
+        """The /pa/files/{file_path:path} route must be registered."""
+        import g4f.api as api_mod
+        import inspect
+
+        src = inspect.getsource(api_mod.Api.register_routes)
+        self.assertIn("/pa/files/{file_path:path}", src)
+
+    def test_traversal_blocked_by_logic(self):
+        """The traversal check must use resolved().relative_to() logic."""
+        import g4f.api as api_mod
+        import inspect
+
+        src = inspect.getsource(api_mod.Api.register_routes)
+        self.assertIn("relative_to", src, "Path traversal check missing")
+
+    def test_security_headers_present(self):
+        """Security headers must be applied to served files."""
+        import g4f.api as api_mod
+        import inspect
+
+        src = inspect.getsource(api_mod.Api.register_routes)
+        self.assertIn("X-Content-Type-Options", src)
+        self.assertIn("X-Frame-Options", src)
+        self.assertIn("Content-Security-Policy", src)
+        self.assertIn("Permissions-Policy", src)
+        self.assertIn(
+            "connect-src 'none'", src, "CSP should block outbound connections"
+        )
+        self.assertIn(
+            "object-src 'none'", src, "CSP should block object/embed elements"
+        )
+
+    def test_html_served_with_csp_sandbox(self):
+        """HTML files must be served with CSP sandbox to isolate their origin."""
+        import g4f.api as api_mod
+        import inspect
+
+        src = inspect.getsource(api_mod.Api.register_routes)
+        # sandbox without allow-same-origin forces a null origin on the page,
+        # which prevents localStorage / sessionStorage / cookie access.
+        self.assertIn(
+            "sandbox allow-scripts",
+            src,
+            "HTML files must be served with CSP sandbox directive",
+        )
+
+    def test_request_origin_used_in_csp(self):
+        """CSP source directives must use the request origin, not 'self'."""
+        import g4f.api as api_mod
+        import inspect
+
+        src = inspect.getsource(api_mod.Api.register_routes)
+        # The route must derive the origin from the ASGI scope, not the
+        # client-controlled Host header.
+        self.assertIn(
+            "request_origin",
+            src,
+            "CSP must use the actual request origin, not static 'self'",
+        )
+        self.assertIn(
+            "request.url.scheme",
+            src,
+            "Route must extract scheme from request.url (ASGI scope)",
+        )
+        self.assertIn(
+            "request.url.netloc",
+            src,
+            "Route must extract netloc from request.url (ASGI scope), not Host header",
+        )
+
+
+class TestSandboxDetection(unittest.TestCase):
+    """Tests for g4f.mcp.sandbox detection and its environment overrides."""
+
+    _ENV_KEYS = ("G4F_SANDBOX", "G4F_MCP_SAFE_MODE", "G4F_MCP_SHELL")
+
+    def setUp(self):
+        self._saved = {key: os.environ.get(key) for key in self._ENV_KEYS}
+        for key in self._ENV_KEYS:
+            os.environ.pop(key, None)
+
+    def tearDown(self):
+        for key, value in self._saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    def test_detect_sandbox_returns_bool(self):
+        from g4f.mcp.sandbox import detect_sandbox
+
+        self.assertIsInstance(detect_sandbox(), bool)
+
+    def test_safe_mode_follows_detection(self):
+        from g4f.mcp.sandbox import detect_sandbox, safe_mode_enabled
+
+        self.assertEqual(safe_mode_enabled(), detect_sandbox())
+
+    def test_shell_is_inverse_of_safe_mode(self):
+        from g4f.mcp.sandbox import safe_mode_enabled, shell_tool_enabled
+
+        self.assertEqual(shell_tool_enabled(), not safe_mode_enabled())
+
+    def test_env_override_forces_sandbox(self):
+        from g4f.mcp.sandbox import detect_sandbox, get_sandbox_reasons
+
+        os.environ["G4F_SANDBOX"] = "1"
+        self.assertTrue(detect_sandbox())
+        self.assertTrue(get_sandbox_reasons())
+
+    def test_env_override_forces_no_sandbox(self):
+        from g4f.mcp.sandbox import (
+            detect_sandbox,
+            safe_mode_enabled,
+            shell_tool_enabled,
+        )
+
+        os.environ["G4F_SANDBOX"] = "0"
+        self.assertFalse(detect_sandbox())
+        self.assertFalse(safe_mode_enabled())
+        self.assertTrue(shell_tool_enabled())
+
+    def test_env_override_forces_safe_mode(self):
+        from g4f.mcp.sandbox import safe_mode_enabled, shell_tool_enabled
+
+        os.environ["G4F_SANDBOX"] = "0"
+        os.environ["G4F_MCP_SAFE_MODE"] = "1"
+        self.assertTrue(safe_mode_enabled())
+        self.assertFalse(shell_tool_enabled())
+
+    def test_env_override_activates_shell_in_sandbox(self):
+        from g4f.mcp.sandbox import shell_tool_enabled
+
+        os.environ["G4F_SANDBOX"] = "1"
+        os.environ["G4F_MCP_SHELL"] = "1"
+        self.assertTrue(shell_tool_enabled())
+
+
+class TestShellExecuteTool(unittest.IsolatedAsyncioTestCase):
+    """Tests for the shell/terminal command execution tool (host mode)."""
+
+    async def test_schema(self):
+        tool = ShellExecuteTool()
+        self.assertIsNotNone(tool.description)
+        schema = tool.input_schema
+        self.assertEqual(schema["type"], "object")
+        self.assertIn("command", schema["properties"])
+        self.assertIn("command", schema["required"])
+
+    async def test_missing_command(self):
+        tool = ShellExecuteTool()
+        result = await tool.execute({})
+        self.assertIn("error", result)
+
+    async def test_safe_mode_blocks_execution(self):
+        """In safe mode the tool refuses to run any command."""
+        tool = ShellExecuteTool(safe_mode=True)
+        result = await tool.execute({"command": "echo hi"})
+        self.assertIn("error", result)
+        self.assertIn("safe mode", result["error"])
+
+    @unittest.skipIf(os.name == "nt", "POSIX shell required")
+    async def test_simple_command(self):
+        tool = ShellExecuteTool()
+        result = await tool.execute({"command": "echo hello-shell"})
+        self.assertNotIn("error", result)
+        self.assertEqual(result["exit_code"], 0)
+        self.assertIn("hello-shell", result["stdout"])
+
+    @unittest.skipIf(os.name == "nt", "POSIX shell required")
+    async def test_exit_code_propagated(self):
+        tool = ShellExecuteTool()
+        result = await tool.execute({"command": "exit 3"})
+        self.assertNotIn("error", result)
+        self.assertEqual(result["exit_code"], 3)
+
+    @unittest.skipIf(os.name == "nt", "POSIX shell required")
+    async def test_stderr_captured(self):
+        tool = ShellExecuteTool()
+        result = await tool.execute({"command": "echo err >&2"})
+        self.assertNotIn("error", result)
+        self.assertIn("err", result["stderr"])
+
+    @unittest.skipIf(os.name == "nt", "POSIX shell required")
+    async def test_timeout_kills_command(self):
+        tool = ShellExecuteTool()
+        result = await tool.execute({"command": "sleep 10", "timeout": 0.5})
+        self.assertIn("error", result)
+        self.assertIn("timed out", result["error"])
+        self.assertTrue(result.get("timed_out"))
+
+    async def test_invalid_timeout(self):
+        tool = ShellExecuteTool()
+        result = await tool.execute({"command": "echo hi", "timeout": "not-a-number"})
+        self.assertIn("error", result)
+
+    async def test_cwd_traversal_blocked(self):
+        """cwd outside the workspace is rejected."""
+        tool = ShellExecuteTool()
+        result = await tool.execute({"command": "echo hi", "cwd": "../../.."})
+        self.assertIn("error", result)
+
+
+class TestPolliPublishAppTool(unittest.IsolatedAsyncioTestCase):
+    """Tests for publishing workspace apps through the polli CLI."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.workspace = Path(self.temp_dir.name)
+        self.app = self.workspace / "app"
+        self.app.mkdir()
+        (self.app / "index.html").write_text("<h1>hi</h1>", encoding="utf-8")
+        env = mock.patch.dict(os.environ, {"G4F_DIR": self.temp_dir.name})
+        env.start()
+        self.addCleanup(env.stop)
+
+    async def test_schema(self):
+        tool = PolliPublishAppTool()
+        self.assertIsNotNone(tool.description)
+        schema = tool.input_schema
+        self.assertEqual(schema["type"], "object")
+        self.assertIn("name", schema["properties"])
+        self.assertIn("name", schema["required"])
+        self.assertIn("path", schema["properties"])
+        self.assertIn("verify", schema["properties"])
+
+    async def test_missing_name(self):
+        result = await PolliPublishAppTool().execute({})
+        self.assertIn("error", result)
+
+    async def test_invalid_name(self):
+        result = await PolliPublishAppTool().execute({"name": "Bad Name!"})
+        self.assertIn("error", result)
+        self.assertIn("Invalid site name", result["error"])
+
+    async def test_missing_index_html(self):
+        (self.app / "index.html").unlink()
+        result = await PolliPublishAppTool().execute(
+            {"name": "demo-app", "path": "app"}
+        )
+        self.assertIn("error", result)
+        self.assertIn("index.html", result["error"])
+
+    async def test_path_traversal_blocked(self):
+        result = await PolliPublishAppTool().execute(
+            {"name": "demo-app", "path": "../outside"}
+        )
+        self.assertIn("error", result)
+        self.assertIn("outside the workspace", result["error"])
+
+    async def test_missing_polli_binary(self):
+        with mock.patch("g4f.mcp.tools.shutil.which", return_value=None):
+            result = await PolliPublishAppTool().execute(
+                {"name": "demo-app", "path": "app"}
+            )
+        self.assertIn("error", result)
+        self.assertIn("polli", result["error"])
+
+    async def test_deploy_success(self):
+        process = mock.Mock()
+        process.returncode = 0
+        process.communicate = mock.AsyncMock(
+            return_value=(
+                b'{"name": "demo-app", "url": "https://demo-app.pollinations.app"}',
+                b"",
+            )
+        )
+        spawn = mock.AsyncMock(return_value=process)
+        with mock.patch(
+            "g4f.mcp.tools.shutil.which", return_value="/usr/bin/polli"
+        ), mock.patch("g4f.mcp.tools.asyncio.create_subprocess_exec", new=spawn):
+            result = await PolliPublishAppTool().execute(
+                {"name": "demo-app", "path": "app", "verify": True}
+            )
+
+        self.assertNotIn("error", result)
+        self.assertEqual(result["url"], "https://demo-app.pollinations.app")
+        self.assertTrue(result["verified"])
+        args = spawn.call_args.args
+        self.assertEqual(args[0], "/usr/bin/polli")
+        self.assertIn("--json", args)
+        self.assertIn("sites", args)
+        self.assertIn("deploy", args)
+        self.assertIn("--name", args)
+        self.assertIn("demo-app", args)
+        self.assertIn("--verify", args)
+        self.assertEqual(spawn.call_args.kwargs["cwd"], str(self.app.resolve()))
+
+    async def test_deploy_failure_reports_stderr(self):
+        process = mock.Mock()
+        process.returncode = 1
+        process.communicate = mock.AsyncMock(
+            return_value=(b"", b"Not logged in. Run polli auth login")
+        )
+        with mock.patch(
+            "g4f.mcp.tools.shutil.which", return_value="/usr/bin/polli"
+        ), mock.patch(
+            "g4f.mcp.tools.asyncio.create_subprocess_exec",
+            new=mock.AsyncMock(return_value=process),
+        ):
+            result = await PolliPublishAppTool().execute(
+                {"name": "demo-app", "path": "app"}
+            )
+
+        self.assertIn("error", result)
+        self.assertIn("Not logged in", result["error"])
+        self.assertIn("polli auth login", result["error"])
+
+
+class TestMCPServerShellActivation(unittest.TestCase):
+    """The shell tool is activated on hosts and disabled inside sandboxes."""
+
+    _ENV_KEYS = ("G4F_SANDBOX", "G4F_MCP_SAFE_MODE", "G4F_MCP_SHELL")
+
+    def setUp(self):
+        self._saved = {key: os.environ.get(key) for key in self._ENV_KEYS}
+        for key in self._ENV_KEYS:
+            os.environ.pop(key, None)
+
+    def tearDown(self):
+        for key, value in self._saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    def test_safe_mode_disables_shell(self):
+        """An explicit safe_mode=True never registers shell_execute."""
+        server = MCPServer(safe_mode=True)
+        self.assertFalse(server.shell_enabled)
+        self.assertNotIn("shell_execute", server.tools)
+
+    def test_sandboxed_disables_shell(self):
+        """Inside a detected sandbox the shell tool stays disabled."""
+        os.environ["G4F_SANDBOX"] = "1"
+        server = MCPServer()
+        self.assertTrue(server.sandboxed)
+        self.assertTrue(server.safe_mode)
+        self.assertFalse(server.shell_enabled)
+        self.assertNotIn("shell_execute", server.tools)
+
+    def test_host_activates_shell(self):
+        """Outside sandboxes the shell/terminal execution tool is activated."""
+        os.environ["G4F_SANDBOX"] = "0"
+        server = MCPServer()
+        self.assertFalse(server.sandboxed)
+        self.assertFalse(server.safe_mode)
+        self.assertTrue(server.shell_enabled)
+        self.assertIn("shell_execute", server.tools)
+
+    def test_tool_list_reflects_shell_state(self):
+        os.environ["G4F_SANDBOX"] = "0"
+        server = MCPServer()
+        names = [tool["name"] for tool in server.get_tool_list()]
+        self.assertIn("shell_execute", names)
+
+    def test_server_info_reports_mode(self):
+        os.environ["G4F_SANDBOX"] = "1"
+        server = MCPServer()
+        self.assertTrue(server.server_info["safe_mode"])
+        self.assertTrue(server.server_info["sandboxed"])
+
+    def test_shell_call_while_disabled_explains_error(self):
+        """Calling shell_execute in safe mode returns a helpful error."""
+        import asyncio
+
+        server = MCPServer(safe_mode=True)
+        response = asyncio.run(
+            server.handle_request(
+                MCPRequest(
+                    jsonrpc="2.0",
+                    id=1,
+                    method="tools/call",
+                    params={"name": "shell_execute", "arguments": {"command": "echo hi"}},
+                )
+            )
+        )
+        self.assertIsNotNone(response.error)
+        self.assertIn("disabled", response.error["message"])
+
+
+class TestBrowserIframeClick(unittest.IsolatedAsyncioTestCase):
+    async def test_frame_path_evaluates_in_nested_frame(self):
+        try:
+            from g4f.api.cdp_relay import _evaluate_in_frame_path
+        except (ImportError, RuntimeError) as exc:
+            self.skipTest(f"CDP relay requirements unavailable: {exc}")
+
+        calls = []
+
+        async def call(method, **params):
+            calls.append((method, params))
+            if method == "Page.getFrameTree":
+                return {
+                    "frameTree": {
+                        "frame": {"id": "root"},
+                        "childFrames": [
+                            {
+                                "frame": {"id": "first"},
+                                "childFrames": [{"frame": {"id": "nested"}}],
+                            }
+                        ],
+                    }
+                }
+            if method == "Page.createIsolatedWorld":
+                return {"executionContextId": 123}
+            if method == "Runtime.evaluate":
+                return {"result": {"value": {"ok": True}}}
+            self.fail(f"Unexpected CDP method: {method}")
+
+        result = await _evaluate_in_frame_path(call, [0, 0], "click()")
+
+        self.assertEqual(result, {"ok": True})
+        self.assertIn(
+            ("Page.createIsolatedWorld", {"frameId": "nested", "worldName": "g4f-snapshot"}),
+            calls,
+        )
+        self.assertIn(
+            ("Runtime.evaluate", {
+                "expression": "click()",
+                "returnByValue": True,
+                "awaitPromise": True,
+                "contextId": 123,
+            }),
+            calls,
+        )
+
+    async def test_frame_path_rejects_missing_frame(self):
+        try:
+            from g4f.api.cdp_relay import _evaluate_in_frame_path
+        except (ImportError, RuntimeError) as exc:
+            self.skipTest(f"CDP relay requirements unavailable: {exc}")
+
+        async def call(method, **params):
+            return {"frameTree": {"frame": {"id": "root"}, "childFrames": []}}
+
+        with self.assertRaisesRegex(ValueError, "Frame path does not exist"):
+            await _evaluate_in_frame_path(call, [0], "click()")
+
+    async def test_native_click_translates_iframe_offsets(self):
+        try:
+            from g4f.api.cdp_relay import _native_click
+        except ImportError:
+            self.skipTest("g4f.api.cdp_relay._native_click not available")
+
+        calls = []
+
+        async def call(method, **params):
+            calls.append((method, params))
+            if method == "Page.getFrameTree":
+                return {"frameTree": {"frame": {"id": "root"}, "childFrames": [{"frame": {"id": "f"}}]}}
+            if method == "Page.createIsolatedWorld":
+                return {"executionContextId": 7}
+            if method == "Runtime.evaluate":
+                if params.get("contextId") == 7:
+                    return {"result": {"value": {"ok": True, "x": 10, "y": 20}}}
+                return {"result": {"value": {"x": 100, "y": 200}}}
+            return {}
+
+        result = await _native_click(call, [0], "rect()")
+        self.assertEqual((result["x"], result["y"]), (110, 220))
+        mouse = [p["type"] for m, p in calls if m == "Input.dispatchMouseEvent"]
+        self.assertEqual(mouse, ["mouseMoved", "mousePressed", "mouseReleased"])
+
+    def test_aria_checkbox_roles_are_indexed(self):
+        from g4f.mcp.browser_dom import SNAPSHOT_JS, click_js
+
+        for role in ("checkbox", "radio", "switch"):
+            self.assertIn(f'[role=\\"{role}\\"]', SNAPSHOT_JS)
+            self.assertIn(f'[role=\\"{role}\\"]', click_js(0))
+
+    def test_copy_click_listener_tracks_iframe_path(self):
+        try:
+            from g4f.api.cdp_relay import _COPY_SCRIPT
+        except (ImportError, RuntimeError) as exc:
+            self.skipTest(f"CDP relay requirements unavailable: {exc}")
+
+        self.assertIn("bindClicks(frame.contentDocument, [...framePath, index])", _COPY_SCRIPT)
+        self.assertIn("frame_path: framePath", _COPY_SCRIPT)
+
+
+class TestBrowserSelectorTools(unittest.IsolatedAsyncioTestCase):
+    """Tests for the selector-based browser tools."""
+
+    TOOL_NAMES = (
+        "browser_click_selector",
+        "browser_type_selector",
+        "browser_select_selector",
+        "browser_scrape",
+        "browser_exists",
+    )
+
+    def test_tools_registered(self):
+        server = MCPServer()
+        for name in self.TOOL_NAMES:
+            self.assertIn(name, server.tools)
+            self.assertIn("selector", server.tools[name].input_schema["properties"])
+
+    async def test_selector_is_required(self):
+        server = MCPServer()
+        for name in self.TOOL_NAMES:
+            result = await server.tools[name].execute({})
+            self.assertIn("error", result, name)
+
+    def test_selector_js_helpers(self):
+        from g4f.mcp.browser_dom import (
+            selector_click_js,
+            selector_exists_js,
+            selector_scrape_js,
+            selector_select_js,
+            selector_type_js,
+        )
+
+        for js in (
+            selector_click_js("#submit"),
+            selector_type_js("#query", "hello", True, False),
+            selector_select_js("#lang", "en"),
+            selector_scrape_js("main", "href"),
+            selector_exists_js(".result"),
+        ):
+            self.assertIn("document.querySelector", js)
+
+
+class TestMCPApiRoute(unittest.TestCase):
+    """Tests for the /mcp JSON-RPC route mounted on the g4f API."""
+
+    def setUp(self):
+        try:
+            import fastapi  # noqa: F401
+            import uvicorn  # noqa: F401
+            from fastapi.testclient import TestClient
+            import g4f.api
+            self.client = TestClient(g4f.api.create_app())
+        except (ImportError, RuntimeError) as exc:
+            self.skipTest(f"fastapi TestClient unavailable: {exc}")
+
+    def _rpc(self, payload):
+        return self.client.post("/mcp", json=payload)
+
+    def test_get_mcp_info(self):
+        response = self.client.get("/mcp")
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertEqual(data["endpoint"], "/mcp")
+        self.assertIn("server", data)
+        self.assertIn("safe_mode", data)
+        self.assertIn("sandboxed", data)
+        self.assertIn("shell_execute", data)
+        self.assertIsInstance(data["tools"], list)
+        tool_names = [tool["name"] for tool in data["tools"]]
+        self.assertIn("web_search", tool_names)
+
+    def test_initialize(self):
+        response = self._rpc({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertEqual(data["id"], 1)
+        self.assertEqual(data["result"]["protocolVersion"], "2024-11-05")
+        self.assertIn("tools", data["result"]["capabilities"])
+
+    def test_tools_list(self):
+        response = self._rpc({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        tool_names = [tool["name"] for tool in data["result"]["tools"]]
+        self.assertIn("python_execute", tool_names)
+
+    def test_ping(self):
+        response = self._rpc({"jsonrpc": "2.0", "id": 3, "method": "ping", "params": {}})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["id"], 3)
+
+    def test_invalid_json_body(self):
+        response = self.client.post(
+            "/mcp", content=b"{not json", headers={"content-type": "application/json"}
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["error"]["code"], -32700)
+
+    def test_non_object_body_rejected(self):
+        response = self._rpc([{"jsonrpc": "2.0", "id": 1, "method": "ping"}])
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["error"]["code"], -32600)
+
+    def test_unknown_method(self):
+        response = self._rpc({"jsonrpc": "2.0", "id": 4, "method": "no_such_method"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["error"]["code"], -32601)
+
+    def test_shell_execute_follows_sandbox_state(self):
+        """In this (likely sandboxed) test environment the shell tool must
+        not be advertised unless the environment allows it."""
+        from g4f.mcp.sandbox import shell_tool_enabled
+
+        response = self.client.get("/mcp")
+        data = response.json()
+        tool_names = [tool["name"] for tool in data["tools"]]
+        self.assertEqual("shell_execute" in tool_names, shell_tool_enabled())

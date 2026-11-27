@@ -19,7 +19,7 @@ RUN if [ "$G4F_VERSION" = "" ] ; then \
 RUN apt-get -qqy update \
   && apt-get -qqy upgrade \
   && apt-get -qyy autoremove \
-  && apt-get -qqy install python3 python-is-python3 pip \
+  && apt-get -qqy install python3 python-is-python3 pip ffmpeg flac libavcodec-extra \
   && apt-get -qyy remove openjdk-11-jre-headless \
   && apt-get -qyy autoremove \
   && apt-get -qyy clean \
@@ -45,8 +45,7 @@ WORKDIR $G4F_DIR
 COPY requirements.txt $G4F_DIR
 
 # Upgrade pip for the latest features and install the project's Python dependencies.
-RUN pip install --break-system-packages --upgrade pip \
-  && pip install --break-system-packages -r requirements.txt
+RUN pip install --no-cache-dir --break-system-packages -r requirements.txt
 
 # Copy the entire package into the container.
 ADD --chown=$SEL_UID:$SEL_GID g4f $G4F_DIR/g4f

@@ -1,0 +1,2510 @@
+"""
+CDP Clients — Lightweight Chrome DevTools Protocol (CDP) automation.
+
+This module provides two CDP client implementations for browser automation:
+
+──────────────────────────────────────────────────────────────────────
+CDPSession (Async) — for high-throughput providers like Cloudflare.
+──────────────────────────────────────────────────────────────────────
+  • Fully async (asyncio + aiohttp WebSocket).
+  • Background receiver loop for event-driven communication.
+  • Best for providers that stream responses and need concurrency.
+
+  Example:
+      session = CDPSession(port=9222, headless=False)
+      await session.start()
+      try:
+          await session.navigate("https://example.com")
+          title = await session.evaluate_js("document.title")
+      finally:
+          await session.close()
+
+──────────────────────────────────────────────────────────────────────
+Common features:
+  • Auto-detects Chrome/Chromium/Edge path via BrowserConfig or system PATH.
+  • Stores browser profiles in g4f cookies directory (no project root pollution).
+  • Offscreen windowed mode (--window-position=-2000,-2000) bypasses Turnstile.
+  • Browser-level CDP WebSocket servers (e.g. Lightpanda) that expose no
+    /json/new HTTP endpoint: targets are created via Target.createTarget and
+    attached with a flat session (Target.attachToTarget, flatten=True).
+    Such servers are also shut down through CDP (Browser.close on the
+    browser-level socket) instead of a process handle or /json/close.
+  • Lightpanda installed by ``g4f-go browser install`` is detected in the
+    shared config directory and preferred over Chrome whenever headless mode
+    is on (see find_lightpanda_path / lightpanda_auto_start_enabled).
+  • Android app: creates dedicated automation WebViews through its DevTools
+    socket (browser_mode="webview", auto-detected — no Chrome needed). Each
+    target is shown in front of the app UI with a close button; WebView
+    debugging is disabled again when the last target is closed.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import json
+import logging
+import math
+import os
+import shutil
+import platform
+import subprocess
+import time
+import urllib.error
+import urllib.request
+from typing import Optional, Dict, Any, List, AsyncIterator
+import hashlib
+from urllib.parse import quote_plus, urlparse
+import datetime
+
+try:
+    import aiohttp
+except ImportError:
+    pass
+
+from ..cookies import BrowserConfig, read_har_cookies
+from ..requests.defaults import CHROME_VERSION
+from ..mcp.browser_dom import STEALTH_JS
+from ..files import secure_filename
+from .. import debug
+
+try:
+    from PIL import Image
+    has_pillow = True
+except ImportError:
+    has_pillow = False
+
+logger = logging.getLogger(__name__)
+
+# Chrome user agent used to mask non-Chrome browsers (e.g. Lightpanda, which
+# reports "Lightpanda/1.0"). Kept in sync with the sec-ch-ua version in
+# g4f/requests/defaults.py.
+CHROME_USER_AGENT = (
+    f"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    f"(KHTML, like Gecko) Chrome/{CHROME_VERSION}.0.0.0 Safari/537.36"
+)
+
+from pathlib import Path
+
+def get_screenshot_dir(datekey: str = None) -> str:
+    """Get the screenshot directory, creating it if necessary."""
+    try:
+        from g4f.image.copy_images import get_media_dir
+        media_dir = get_media_dir()
+    except ImportError:
+        import tempfile
+        media_dir = os.path.join(tempfile.gettempdir(), "g4f_media")
+    screenshots_dir = os.path.join(media_dir, "screenshots")
+    if datekey:
+        screenshots_dir = os.path.join(screenshots_dir, datekey)
+    os.makedirs(screenshots_dir, exist_ok=True)
+    return screenshots_dir
+
+
+def find_chrome_path() -> Optional[str]:
+    """Search for Google Chrome or Chromium binary depending on OS."""
+    try:
+        from g4f.cookies import BrowserConfig
+
+        if BrowserConfig.executable_path and os.path.exists(
+            BrowserConfig.executable_path
+        ):
+            return BrowserConfig.executable_path
+    except ImportError:
+        pass
+
+    for name in [
+        "google-chrome",
+        "google-chrome-stable",
+        "chromium",
+        "chromium-browser",
+        "chrome",
+        "msedge",
+        "helium",
+    ]:
+        path = shutil.which(name)
+        if path:
+            return path
+
+    sys_name = platform.system().lower()
+    if sys_name == "linux":
+        for path in [
+            "/usr/bin/google-chrome",
+            "/opt/google/chrome/google-chrome",
+            "/usr/bin/chromium-browser",
+            "/usr/bin/microsoft-edge",
+            "/opt/helium/helium",
+        ]:
+            if os.path.exists(path):
+                return path
+    elif sys_name in ("macos", "darwin"):
+        for path in [
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+        ]:
+            if os.path.exists(path):
+                return path
+    elif sys_name == "windows":
+        paths = [
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+            r"C:\Program Files\Helium\Application\helium.exe",
+            r"C:\Program Files (x86)\Helium\Application\helium.exe",
+            r"C:\Program Files\Helium\helium.exe",
+        ]
+        for path in paths:
+            if os.path.exists(path):
+                return path
+    return None
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Lightpanda — the headless browser installed by `g4f-go browser install`.
+# ──────────────────────────────────────────────────────────────────────
+
+_LIGHTPANDA_BINARY = "lightpanda.exe" if os.name == "nt" else "lightpanda"
+
+
+def get_lightpanda_dir() -> str:
+    """Directory where g4f-go installs the Lightpanda browser."""
+    from ..config import get_config_dir
+
+    return os.path.join(str(get_config_dir()), "browser")
+
+
+def get_http_cache_dir() -> str:
+    """Directory where Lightpanda stores its HTTP cache."""
+    from ..config import get_config_dir
+
+    return os.path.join(str(get_config_dir()), "cache", "http_cache")
+
+
+def find_lightpanda_path() -> Optional[str]:
+    """Locate the Lightpanda binary installed by ``g4f-go browser install``.
+
+    Mirrors g4f-go's install layout (``<config dir>/browser/lightpanda``) and
+    falls back to a ``lightpanda`` executable on PATH. Override the location
+    with ``G4F_BROWSER_LIGHTPANDA_PATH``.
+    """
+    override = os.environ.get("G4F_BROWSER_LIGHTPANDA_PATH")
+    if override and os.path.exists(override):
+        return override
+    path = os.path.join(get_lightpanda_dir(), _LIGHTPANDA_BINARY)
+    if os.path.exists(path):
+        return path
+    return shutil.which("lightpanda")
+
+
+def lightpanda_auto_start_enabled(headless: bool) -> bool:
+    """Whether the installed Lightpanda should be started for this run.
+
+    Mirrors g4f-go's ``browserAutoStartEnv`` skip conditions: headless mode
+    must be on, no CDP endpoint may be configured (``G4F_BROWSER_PORT``) and
+    the transport must be plain CDP (``G4F_BROWSER_MODE`` unset or ``cdp``).
+    """
+    if not headless:
+        return False
+    if os.environ.get("G4F_BROWSER_PORT"):
+        return False
+    mode = os.environ.get("G4F_BROWSER_MODE")
+    if mode and mode != "cdp":
+        return False
+    return find_lightpanda_path() is not None
+
+
+def _lightpanda_pid_file() -> str:
+    """PID file recording the Lightpanda we started (mirrors g4f-go)."""
+    return os.path.join(get_lightpanda_dir(), ".autostart.pid")
+
+
+def _reap_stale_lightpanda():
+    """Kill a previously auto-started Lightpanda that outlived its parent.
+
+    Only the PID recorded in the pid file is touched, so a Lightpanda the
+    user started themselves is never affected.
+    """
+    pid_file = _lightpanda_pid_file()
+    try:
+        with open(pid_file) as f:
+            pid = int(f.read().strip())
+    except Exception:
+        return
+    try:
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(pid)],
+                capture_output=True,
+                timeout=10,
+            )
+        else:
+            os.kill(pid, 15)
+    except Exception:
+        pass
+    try:
+        os.remove(pid_file)
+    except Exception:
+        pass
+
+
+def _start_lightpanda(host: str, timeout: float = 10.0) -> Optional[int]:
+    """Start the installed Lightpanda CDP server on a free port.
+
+    Returns the port it listens on, or None when it could not be started.
+    The process is recorded as the shared browser, so the regular shutdown
+    paths (idle timer, atexit, API lifespan) stop it again.
+    """
+    global _shared_browser_process, _shared_browser_adopted
+
+    exe = find_lightpanda_path()
+    if not exe:
+        return None
+
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+
+    _reap_stale_lightpanda()
+
+    cmd = [
+        exe, "serve", "--host", host, "--port", str(port),
+        "--block-private-networks",
+        "--load-resources", "iframe",
+        "--http-cache-dir", get_http_cache_dir(),
+    ]
+    debug.log(f"CDP: Launching Lightpanda: {' '.join(cmd)}")
+    try:
+        _shared_browser_process = subprocess.Popen(
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+    except Exception as e:
+        debug.log(f"CDP: failed to launch Lightpanda: {e}")
+        _shared_browser_process = None
+        return None
+    _shared_browser_adopted = False
+    try:
+        with open(_lightpanda_pid_file(), "w") as f:
+            f.write(str(_shared_browser_process.pid))
+    except Exception:
+        pass
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if _shared_browser_process.poll() is not None:
+            debug.log("CDP: Lightpanda exited during startup")
+            _shared_browser_process = None
+            return None
+        try:
+            with urllib.request.urlopen(
+                f"http://{host}:{port}/json/version", timeout=0.5
+            ) as response:
+                if response.status == 200:
+                    debug.log(f"CDP: Lightpanda ready on port {port}")
+                    return port
+        except Exception:
+            pass
+        time.sleep(0.1)
+
+    debug.log(f"CDP: Lightpanda did not become ready on port {port}")
+    try:
+        _shared_browser_process.kill()
+    except Exception:
+        pass
+    _shared_browser_process = None
+    return None
+
+
+import threading
+import atexit
+
+_shared_browser_process = None
+_shared_browser_port = None
+_last_shared_browser_port = None  # Port of the last known browser (survives shutdown)
+_shared_browser_adopted = False  # True when the browser was found running (not launched by us)
+_shared_browser_lock = threading.Lock()
+_shared_browser_refcount = 0  # Track active CDP sessions for parallel tabs
+_shared_browser_idle_timer = None  # Timer to shut down browser after idle period
+_SHARED_BROWSER_IDLE_TIMEOUT = 60  # seconds to keep browser alive with zero tabs
+
+
+def _close_browser_via_cdp(host: str, port: int, timeout: float = 5.0) -> bool:
+    """Close the browser gracefully via the CDP ``Browser.close`` command.
+
+    Connects to the browser-level WebSocket (discovered through
+    /json/version) and sends Browser.close. This works even when we hold no
+    process handle (adopted instances) and on Windows, where killing only
+    the main process can leave the browser (and its profile lock) behind.
+
+    Servers without a /json/version endpoint (e.g. Lightpanda, which only
+    exposes a single browser-level WebSocket at ``ws://host:port/`` and an
+    empty /json/list) are closed through that socket directly — for adopted
+    instances this is the only way to shut them down at all.
+
+    Returns False when the server rejected the command (Lightpanda answers
+    ``-32601 'Browser.close' wasn't found`` and keeps running), so callers
+    holding a process handle can kill it instead.
+    """
+    ws_url = None
+    try:
+        with urllib.request.urlopen(
+            f"http://{host}:{port}/json/version", timeout=timeout
+        ) as response:
+            ws_url = json.loads(response.read().decode("utf-8")).get(
+                "webSocketDebuggerUrl"
+            )
+        if not ws_url:
+            debug.log("CDP: /json/version has no webSocketDebuggerUrl — trying browser-level socket")
+    except Exception as e:
+        debug.log(f"CDP: could not fetch browser WebSocket URL for Browser.close: {e}")
+    if not ws_url:
+        # Browser-level CDP servers (e.g. Lightpanda) serve no /json/version
+        # — their browser WebSocket lives at the root path.
+        ws_url = f"ws://{host}:{port}/"
+
+    async def _send_browser_close():
+        import aiohttp
+
+        async with aiohttp.ClientSession() as session:
+            async with session.ws_connect(ws_url, timeout=timeout) as ws:
+                await ws.send_str(json.dumps({"id": 1, "method": "Browser.close"}))
+                # Chrome replies and then closes the socket. Servers that do
+                # not implement Browser.close (Lightpanda: -32601) answer with
+                # an error and keep running — report that so the caller can
+                # fall back to killing the process it launched.
+                try:
+                    msg = await asyncio.wait_for(ws.receive(), timeout=timeout)
+                    if msg.type == aiohttp.WSMsgType.TEXT:
+                        reply = json.loads(msg.data)
+                        if reply.get("error"):
+                            debug.log(
+                                f"CDP: Browser.close rejected by {host}:{port}: "
+                                f"{reply['error']}"
+                            )
+                            return False
+                except asyncio.TimeoutError:
+                    pass
+                except Exception:
+                    pass
+                # Drain whatever else arrives until the socket closes.
+                try:
+                    async for _ in ws:
+                        pass
+                except Exception:
+                    pass
+                return True
+
+    try:
+        closed = asyncio.run(asyncio.wait_for(_send_browser_close(), timeout=timeout))
+    except RuntimeError:
+        # Called from a thread with a running event loop — use our own.
+        result: List[bool] = []
+        thread = threading.Thread(
+            target=lambda: result.append(
+                asyncio.run(asyncio.wait_for(_send_browser_close(), timeout=timeout))
+            ),
+            daemon=True,
+        )
+        thread.start()
+        thread.join(timeout + 1)
+        closed = result[0] if result else False
+    except Exception as e:
+        debug.log(f"CDP: Browser.close via CDP failed: {e}")
+        return False
+    if closed:
+        debug.log(f"CDP: Browser.close sent via CDP to {host}:{port}")
+    return closed
+
+
+def _kill_shared_browser_process():
+    """Kill the browser process we launched, if any. Returns True when killed."""
+    global _shared_browser_process
+    if not _shared_browser_process:
+        return False
+    try:
+        if os.name == "nt":
+            # Kill the whole browser process tree. Terminating only the main
+            # process can leave children (and the profile lock) behind, which
+            # blocks the next launch via singleton handoff.
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(_shared_browser_process.pid)],
+                capture_output=True,
+                timeout=10,
+            )
+        else:
+            _shared_browser_process.terminate()
+    except Exception:
+        pass
+    try:
+        _shared_browser_process.wait(timeout=10)
+    except Exception:
+        try:
+            _shared_browser_process.kill()
+        except Exception:
+            pass
+    _shared_browser_process = None
+    try:
+        os.remove(_lightpanda_pid_file())
+    except Exception:
+        pass
+    return True
+
+
+def _terminate_shared_browser():
+    """Terminate the shared browser process and reset state."""
+    global _shared_browser_process, _shared_browser_port, _shared_browser_adopted
+    if _shared_browser_process or _shared_browser_port is not None:
+        # Ask the browser to shut down gracefully via CDP first. This also
+        # closes browsers we hold no process handle for (e.g. after a
+        # Windows singleton handoff), which otherwise stay open.
+        if _shared_browser_port is not None and not _shared_browser_adopted:
+            _close_browser_via_cdp("127.0.0.1", _shared_browser_port)
+        _kill_shared_browser_process()
+    _shared_browser_port = None
+    _shared_browser_adopted = False
+
+
+def _close_shared_browser_idle():
+    """Close the shared browser gracefully after the idle timeout.
+
+    Only the CDP ``Browser.close`` command is sent — the browser shuts
+    itself down cleanly (no process kill, no profile lock leftovers,
+    no crash-restore prompts on the next launch). Browsers adopted from
+    other processes (not started by g4f) are left untouched.
+
+    Servers that do not implement ``Browser.close`` (Lightpanda answers
+    with ``-32601`` and keeps running) are killed through the process
+    handle we hold instead, so they don't linger forever.
+    """
+    global _shared_browser_process, _shared_browser_port, _shared_browser_adopted
+    global _shared_browser_idle_timer
+    with _shared_browser_lock:
+        if _shared_browser_idle_timer is not threading.current_thread() or _shared_browser_refcount:
+            return
+        _shared_browser_idle_timer = None
+        closed = False
+        if _shared_browser_port is not None and not _shared_browser_adopted:
+            closed = _close_browser_via_cdp("127.0.0.1", _shared_browser_port)
+        if closed and _shared_browser_process:
+            try:
+                _shared_browser_process.wait(timeout=10)
+            except Exception:
+                closed = False
+        if not closed:
+            _kill_shared_browser_process()
+        _shared_browser_process = None
+        _shared_browser_port = None
+        _shared_browser_adopted = False
+
+def _schedule_idle_shutdown():
+    """Schedule browser termination after idle timeout (call under lock)."""
+    global _shared_browser_idle_timer
+    if _shared_browser_idle_timer:
+        _shared_browser_idle_timer.cancel()
+    try:
+        timeout = float(os.environ.get("G4F_BROWSER_IDLE_TIMEOUT", _SHARED_BROWSER_IDLE_TIMEOUT))
+        if not math.isfinite(timeout) or timeout < 0:
+            raise ValueError
+    except ValueError:
+        timeout = _SHARED_BROWSER_IDLE_TIMEOUT
+    _shared_browser_idle_timer = threading.Timer(timeout, _close_shared_browser_idle)
+    _shared_browser_idle_timer.daemon = True
+    _shared_browser_idle_timer.start()
+    debug.log(f"CDP: Browser.close scheduled in {timeout}s (idle)")
+
+
+def _cancel_idle_shutdown():
+    """Cancel any pending idle shutdown timer (call under lock)."""
+    global _shared_browser_idle_timer
+    if _shared_browser_idle_timer:
+        _shared_browser_idle_timer.cancel()
+        _shared_browser_idle_timer = None
+
+
+def _cleanup_shared_browser():
+    global _shared_browser_refcount, _shared_browser_idle_timer
+    if _shared_browser_idle_timer:
+        _shared_browser_idle_timer.cancel()
+        _shared_browser_idle_timer = None
+    _terminate_shared_browser()
+    _shared_browser_refcount = 0
+
+
+atexit.register(_cleanup_shared_browser)
+
+
+def acquire_shared_browser_ref():
+    """Increment the shared browser reference count (call when opening a new tab)."""
+    global _shared_browser_refcount
+    with _shared_browser_lock:
+        _cancel_idle_shutdown()
+        _shared_browser_refcount += 1
+        debug.log(f"CDP: Acquired browser tab (#{_shared_browser_refcount} active)")
+
+
+def release_shared_browser_ref() -> bool:
+    """Decrement the shared browser reference count.
+    Returns True if the refcount reached 0 (browser kept alive for reuse)."""
+    global _shared_browser_refcount
+    with _shared_browser_lock:
+        _shared_browser_refcount = max(0, _shared_browser_refcount - 1)
+        debug.log(f"CDP: Released browser tab (#{_shared_browser_refcount} remaining)")
+        if _shared_browser_refcount == 0:
+            _schedule_idle_shutdown()
+        return _shared_browser_refcount == 0
+
+
+def find_running_cdp_port(host: str) -> Optional[int]:
+    """Scan running processes for an active Chrome/Helium instance with remote debugging enabled."""
+    try:
+        import psutil
+
+        for proc in psutil.process_iter(["name", "cmdline"]):
+            try:
+                cmdline = proc.info.get("cmdline") or []
+                proc_name = (proc.info.get("name") or "").lower()
+                if any(
+                    n in proc_name
+                    for n in ("chrome", "chromium", "edge", "helium", "app")
+                ):
+                    for arg in cmdline:
+                        if arg.startswith("--remote-debugging-port="):
+                            try:
+                                port = int(arg.split("=")[1])
+                                # Verify if it's reachable and working
+                                with urllib.request.urlopen(
+                                    f"http://{host}:{port}/json", timeout=0.5
+                                ) as response:
+                                    if response.status == 200:
+                                        return port
+                            except Exception:
+                                pass
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return None
+
+
+_PORT_FILE_NAME = "cdp_port.txt"
+
+def _save_browser_port(user_data_dir: str, port: int):
+    """Record the shared browser port next to its profile for later rediscovery."""
+    try:
+        with open(os.path.join(user_data_dir, _PORT_FILE_NAME), "w") as f:
+            f.write(str(port))
+    except Exception:
+        pass
+
+def _read_saved_browser_port(host: str, user_data_dir: Optional[str] = None) -> Optional[int]:
+    """Probe the port recorded for the shared browser profile, if still alive."""
+    if user_data_dir is None:
+        try:
+            from platformdirs import user_config_dir
+
+            user_data_dir = user_config_dir("g4f-cdp")
+        except Exception:
+            return None
+    port_file = os.path.join(user_data_dir, _PORT_FILE_NAME)
+    try:
+        with open(port_file) as f:
+            port = int(f.read().strip())
+    except Exception:
+        return None
+    try:
+        with urllib.request.urlopen(
+            f"http://{host}:{port}/json", timeout=0.5
+        ) as response:
+            if response.status == 200:
+                return port
+    except Exception:
+        pass
+    # Stale — clean up so we don't probe it forever
+    try:
+        os.remove(port_file)
+    except Exception:
+        pass
+    return None
+
+def get_shared_browser(
+    host: str,
+    preferred_port: int,
+    headless: bool = True,
+    proxy: Optional[str] = None,
+    browser_args: Optional[List[str]] = None,
+    disable_web_security: bool = False,
+) -> int:
+    """
+    Ensure a single shared browser instance is running and return its port.
+    If a browser is already running anywhere on the system, we use it directly.
+
+    ``proxy``/``browser_args`` only take effect when the shared browser is
+    first launched — later callers reusing the shared process are ignored,
+    since Chrome does not support changing its proxy at runtime.
+    """
+    global _shared_browser_process, _shared_browser_port, _last_shared_browser_port
+    global _shared_browser_adopted
+
+    with _shared_browser_lock:
+        if preferred_port is not None:
+            try:
+                with urllib.request.urlopen(
+                    f"http://{host}:{preferred_port}/json", timeout=0.5
+                ) as response:
+                    if response.status == 200:
+                        return preferred_port
+            except urllib.error.HTTPError as e:
+                # The port serves HTTP but has no Chrome-style /json endpoint
+                # — likely an alternative CDP server (e.g. Lightpanda, which
+                # returns an empty /json/list and no /json/new). Adopt the
+                # port anyway; target creation then falls back to the
+                # browser-level WebSocket (see _start_via_browser_socket).
+                if e.code in (403, 404, 405, 501):
+                    debug.log(
+                        f"CDP: port {preferred_port} has no /json endpoint "
+                        f"(HTTP {e.code}) — adopting it as CDP server"
+                    )
+                    # Record the port as the shared browser. We hold no process
+                    # handle for it, so _terminate_shared_browser closes it via
+                    # the CDP Browser.close command (root WebSocket fallback in
+                    # _close_browser_via_cdp) — the only way to stop it.
+                    _shared_browser_port = preferred_port
+                    _shared_browser_process = None
+                    _shared_browser_adopted = False
+                    return preferred_port
+            except Exception:
+                pass
+
+        # 1. If we already started a shared browser in this thread, check if it's still alive/reachable
+        if _shared_browser_port is not None:
+            try:
+                with urllib.request.urlopen(
+                    f"http://{host}:{_shared_browser_port}/json", timeout=0.5
+                ) as response:
+                    if response.status == 200:
+                        return _shared_browser_port
+            except Exception:
+                # Browser died or became unreachable, clean up
+                if _shared_browser_process:
+                    try:
+                        _shared_browser_process.terminate()
+                    except Exception:
+                        pass
+                    _shared_browser_process = None
+                _shared_browser_port = None
+
+        # 2. Prefer the Lightpanda browser installed by `g4f-go browser install`
+        # whenever headless mode is on — it is a fraction of Chrome's size and
+        # needs no display. Skipped when a CDP endpoint is configured or the
+        # transport is not plain CDP (mirrors g4f-go's auto-start conditions).
+        # Checked before adopting an already-running browser so the installed
+        # Lightpanda wins, exactly as it does when g4f-go sets G4F_BROWSER_PORT.
+        if lightpanda_auto_start_enabled(headless):
+            port = _start_lightpanda(host)
+            if port is not None:
+                _shared_browser_port = port
+                _last_shared_browser_port = port
+                return port
+
+        # 3. Check if a browser is already running with CDP remote debugging.
+        # Probe the port recorded for our own profile first — a browser we
+        # started earlier may still be alive (also without psutil).
+        running_port = _read_saved_browser_port(host, user_data_dir=None)
+        adopted_external = False
+        if running_port is None:
+            # Fall back to scanning processes for any CDP-enabled browser.
+            running_port = find_running_cdp_port(host)
+            adopted_external = running_port is not None
+        if running_port is not None:
+            _shared_browser_port = running_port
+            _shared_browser_process = None  # Not started here — don't own it
+            _shared_browser_adopted = adopted_external
+            return _shared_browser_port
+
+        # 4. Otherwise, launch a new shared Chromium process on a free port
+        chrome_path = find_chrome_path()
+        if not chrome_path:
+            raise RuntimeError("Google Chrome / Chromium / Edge executable not found.")
+
+        # Find a free port dynamically
+        import socket
+
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+
+        # Use standard user config directory for profile caching (like other g4f browsers)
+        try:
+            from platformdirs import user_config_dir
+
+            user_data_dir = user_config_dir("g4f-cdp")
+        except ImportError:
+            import tempfile
+
+            user_data_dir = os.path.join(
+                tempfile.gettempdir(), "g4f_chrome_profile_cdp"
+            )
+        os.makedirs(user_data_dir, exist_ok=True)
+
+        # Remove stale SingletonLock / SingletonSocket / SingletonCookie left
+        # behind by a previous Chrome crash — otherwise the new process refuses
+        # to start with "Failed to create …/SingletonLock: File exists".
+        for lock_name in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
+            lock_path = os.path.join(user_data_dir, lock_name)
+            try:
+                if os.path.islink(lock_path) or os.path.exists(lock_path):
+                    os.remove(lock_path)
+            except Exception:
+                pass
+
+        cmd = [
+            chrome_path,
+            f"--remote-debugging-port={port}",
+            f"--user-data-dir={user_data_dir}",
+            "--window-size=1280,720",
+            "--no-default-browser-check",
+            "--disable-suggestions-ui",
+            "--no-first-run",
+            "--disable-infobars",
+            "--disable-popup-blocking",
+            "--hide-crash-restore-bubble",
+            # Required for CDP WebSocket connections on Chrome 111+
+            "--remote-allow-origins=*",
+        ]
+        # Chrome refuses to run as root without --no-sandbox (zygote host
+        # check, crbug.com/638180) — common in Docker containers.
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            cmd.append("--no-sandbox")
+        if disable_web_security:
+            cmd.extend([
+                # Chrome only honors the last --disable-features flag, so all
+                # values must be merged into a single argument.
+                "--disable-features=PrivacySandboxSettings4,IsolateOrigins,site-per-process",
+                "--disable-blink-features=AutomationControlled",
+                "--disable-web-security",
+            ])
+        if headless:
+            cmd.append("--headless=new")
+        if proxy:
+            cmd.append(f"--proxy-server={proxy}")
+        if browser_args:
+            cmd.extend(browser_args)
+
+        debug.log(f"CDP: Launching Chrome: {' '.join(cmd)}")
+        _shared_browser_process = subprocess.Popen(
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+        )
+        proc = _shared_browser_process
+        _shared_browser_adopted = False
+        _last_shared_browser_port = port
+        _save_browser_port(user_data_dir, port)
+
+        # Drain stderr in the background — an unread pipe fills up and can
+        # block Chrome. Keep a tail of the last lines for diagnostics.
+        stderr_tail: List[str] = []
+
+        def _drain_stderr():
+            try:
+                for line in proc.stderr:
+                    stderr_tail.append(line.decode("utf-8", errors="replace"))
+                    if len(stderr_tail) > 50:
+                        stderr_tail.pop(0)
+            except Exception:
+                pass
+
+        threading.Thread(target=_drain_stderr, daemon=True).start()
+
+        # Wait up to 20 seconds for readiness
+        for _ in range(40):
+            time.sleep(0.5)
+            try:
+                with urllib.request.urlopen(
+                    f"http://{host}:{port}/json", timeout=1
+                ) as response:
+                    if response.status == 200:
+                        _shared_browser_port = port
+                        debug.log(f"CDP: Shared Chrome ready on port {port}")
+                        return _shared_browser_port
+            except Exception:
+                pass
+
+        # Chrome did not become ready on the new port. If an older instance
+        # still holds the profile (singleton handoff), adopt it instead of
+        # failing — it is a fully usable shared browser.
+        adopted_port = find_running_cdp_port(host)
+        if adopted_port is None and _last_shared_browser_port is not None:
+            try:
+                with urllib.request.urlopen(
+                    f"http://{host}:{_last_shared_browser_port}/json", timeout=0.5
+                ) as response:
+                    if response.status == 200:
+                        adopted_port = _last_shared_browser_port
+            except Exception:
+                pass
+        if adopted_port is not None:
+            _shared_browser_port = adopted_port
+            _shared_browser_process = None  # Not our child — don't manage its lifetime
+            _shared_browser_adopted = False  # Same profile — safe to close via CDP
+            debug.log(f"CDP: Adopted already-running Chrome on port {adopted_port}")
+            return _shared_browser_port
+
+        # Chrome failed to become ready — capture stderr for diagnostics
+        stderr_output = ""
+        if proc:
+            try:
+                proc.terminate()
+                proc.wait(timeout=2)
+            except Exception:
+                pass
+            if stderr_tail:
+                stderr_output = "".join(stderr_tail)[-2000:]
+        _shared_browser_process = None
+        raise RuntimeError(
+            f"Failed to start shared Chrome on port {port}"
+            + (f": {stderr_output}" if stderr_output else "")
+        )
+
+# ──────────────────────────────────────────────────────────────────────
+# Android WebView support — drive the app's own WebView via CDP.
+# ──────────────────────────────────────────────────────────────────────
+
+def _is_android() -> bool:
+    """Return True when running under Android (e.g. the Chaquopy app)."""
+    if os.path.exists("/system/build.prop"):
+        return True
+    try:
+        import java  # Chaquopy java bridge  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+def _enable_webview_debugging() -> bool:
+    """Enable remote debugging for all WebViews in this app (process-wide).
+
+    Returns True also when the call itself is not possible (no Chaquopy java
+    bridge) but the app already enabled debugging itself — e.g. via the
+    ``WebViewDebug`` manifest meta-data handled in MainActivity. In that case
+    the DevTools socket exists and attaching is enough.
+    """
+    try:
+        from java import jclass
+
+        WebView = jclass("android.webkit.WebView")
+        WebView.setWebContentsDebuggingEnabled(True)
+        return True
+    except Exception as e:
+        # Not fatal: the app may have enabled debugging on its own. Verify
+        # via the DevTools socket instead of failing hard here.
+        if _find_webview_devtools_socket_exists():
+            debug.log(f"CDP: java bridge unavailable ({e}) — DevTools socket already present")
+            return True
+        debug.log(f"CDP: failed to enable WebView debugging: {e}")
+        return False
+
+def _find_webview_devtools_socket_exists() -> bool:
+    """Return True when a WebView DevTools abstract socket is reachable."""
+    try:
+        _webview_devtools_request(_find_webview_devtools_socket(), "/json/version", timeout=2.0)
+        return True
+    except Exception:
+        return False
+
+def _disable_webview_debugging() -> bool:
+    """Disable remote debugging for all WebViews in this app (process-wide).
+
+    Called when the last automation target has been closed, so the DevTools
+    socket is not exposed while no automation is running. Skipped when the
+    app enables debugging itself via the ``WebViewDebug`` manifest
+    meta-data — in that case the socket stays under app control.
+    """
+    try:
+        from java import jclass
+
+        WebView = jclass("android.webkit.WebView")
+        WebView.setWebContentsDebuggingEnabled(False)
+        debug.log("CDP: WebView debugging disabled (no targets left)")
+        return True
+    except Exception as e:
+        debug.log(f"CDP: failed to disable WebView debugging: {e}")
+        return False
+
+def _is_control_page(target: dict) -> bool:
+    """Return True when a DevTools target is the app's chat UI page.
+
+    The chat UI is served from the embedded server on the loopback
+    interface — accept both hostnames so a changed home origin
+    (localhost vs 127.0.0.1) still matches.
+    """
+    url = target.get("url", "") if isinstance(target, dict) else ""
+    return "//127.0.0.1" in url or "//localhost" in url
+
+def _find_webview_devtools_socket() -> str:
+    """
+    Find the abstract Unix socket name of the WebView DevTools server.
+
+    The WebView listens on ``@webview_devtools_remote_<pid>`` in the app's
+    own process. Since Android 10 apps can no longer read /proc/net/unix,
+    so the pid based name is preferred and the scan is only a fallback.
+    """
+    own = f"webview_devtools_remote_{os.getpid()}"
+    candidates = []
+    try:
+        with open("/proc/net/unix") as fp:
+            for line in fp:
+                name = line.split()[-1].lstrip("@")
+                if name.startswith("webview_devtools_remote_"):
+                    candidates.append(name)
+    except Exception:
+        pass
+    if own in candidates:
+        return own
+    if candidates:
+        return candidates[0]
+    return own
+
+def _webview_devtools_request(socket_name: str, path: str, timeout: float = 5.0):
+    """HTTP GET against the WebView DevTools server over its abstract Unix socket."""
+    import http.client
+    import socket as _socket
+
+    sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+    sock.settimeout(timeout)
+    try:
+        sock.connect("\0" + socket_name)
+        conn = http.client.HTTPConnection("localhost")
+        conn.sock = sock  # reuse the abstract socket connection
+        conn.request("GET", path, headers={"Host": "localhost", "Connection": "close"})
+        body = conn.getresponse().read()
+        return json.loads(body.decode("utf-8", errors="replace"))
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+# DevTools target ids claimed by active webview-mode sessions, so parallel
+# sessions don't attach to the same freshly created automation WebView.
+_webview_claimed_targets = set()
+
+async def _webview_bridge_call(socket_name: str, target: dict, expression: str, timeout: float = 10.0):
+    """Evaluate a JS expression on a WebView target and return its value.
+
+    Used to reach the app's automation bridge (window.G4FAutomation) on the
+    chat UI page, which creates and closes dedicated automation WebViews.
+    """
+    import aiohttp
+
+    ws_path = urlparse(target.get("webSocketDebuggerUrl", "")).path
+    if not ws_path:
+        ws_path = f"/devtools/page/{target.get('id')}"
+    connector = aiohttp.UnixConnector(path="\0" + socket_name)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        ws = await session.ws_connect(f"ws://localhost{ws_path}")
+        try:
+            await ws.send_str(json.dumps({
+                "id": 1,
+                "method": "Runtime.evaluate",
+                "params": {"expression": expression, "returnByValue": True},
+            }))
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                msg = await asyncio.wait_for(ws.receive(), timeout=deadline - time.time())
+                if msg.type != aiohttp.WSMsgType.TEXT:
+                    if msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                        break
+                    continue
+                data = json.loads(msg.data)
+                if data.get("id") == 1:
+                    if "error" in data:
+                        raise RuntimeError(f"WebView bridge error: {data['error']}")
+                    return data.get("result", {}).get("result", {}).get("value")
+        finally:
+            await ws.close()
+    raise TimeoutError("WebView bridge call timed out")
+
+
+def _sanitize_cdp_params(params: dict) -> dict:
+    """Convert CDP command params to JSON-serializable values.
+
+    Provider shims (e.g. ``cdp_browser._CdpFetch.RequestPattern``) pass
+    objects with a ``to_dict()`` method instead of plain dicts — convert
+    them recursively so ``send_json`` can serialize the payload.
+    """
+    def convert(value):
+        if isinstance(value, dict):
+            return {k: convert(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [convert(v) for v in value]
+        if hasattr(value, "to_dict") and callable(value.to_dict):
+            return convert(value.to_dict())
+        return value
+
+    return {k: convert(v) for k, v in params.items()}
+
+
+# target_id -> live CDPSession (open) / info dict (closed) for the /browser page.
+_open_sessions: Dict[str, "CDPSession"] = {}
+_closed_sessions: Dict[str, dict] = {}
+
+
+async def _snapshot_session(session: "CDPSession") -> Optional[str]:
+    from ..mcp.browser_dom import SNAPSHOT_JS, snapshot_frames
+    try:
+        # Read iframe documents through the CDP frame tree so cross-origin
+        # frames are embedded as srcdoc too.
+        html = await asyncio.wait_for(snapshot_frames(session.call), 10)
+        if html:
+            return html
+    except Exception:
+        pass
+    try:
+        return await asyncio.wait_for(session.evaluate_js(SNAPSHOT_JS), 10)
+    except Exception:
+        return None
+
+
+async def list_session_targets() -> Dict[str, List[dict]]:
+    """All targets of CDPSessions in this process: ``open`` (live) and ``closed``."""
+    opened = []
+    for tid, s in list(_open_sessions.items()):
+        info = {"id": tid, "title": "", "url": ""}
+        if s.is_alive:
+            try:
+                info["url"] = await asyncio.wait_for(s.evaluate_js("location.href"), 3)
+                info["title"] = await asyncio.wait_for(s.evaluate_js("document.title"), 3)
+            except Exception:
+                pass
+        opened.append(info)
+    closed = [{"id": t, **i} for t, i in reversed(list(_closed_sessions.items()))]
+    return {"open": opened, "closed": closed}
+
+
+async def snapshot_session_target(target_id: str) -> Optional[str]:
+    """HTML copy of an open session target, or the cached copy of a closed one."""
+    session = _open_sessions.get(target_id)
+    if session is not None:
+        return await _snapshot_session(session)
+    return (_closed_sessions.get(target_id) or {}).get("html")
+
+
+class CDPSession:
+    def __init__(
+        self,
+        port: Optional[int] = None,
+        host: Optional[str] = None,
+        user_data_dir: Optional[str] = None,
+        headless: Optional[bool] = None,
+        proxy: Optional[str] = None,
+        browser_args: Optional[List[str]] = None,
+        disable_web_security: Optional[bool] = None,
+    ):
+        if port is None:
+            port = BrowserConfig.port
+        if host is None:
+            host = BrowserConfig.host
+        if host is None:
+            host = "127.0.0.1"
+        self.port = port
+        self.host = host
+        if headless is None:
+            headless = BrowserConfig.headless
+        self.headless = headless
+        if disable_web_security is None:
+            disable_web_security = BrowserConfig.disable_web_security
+        self.disable_web_security = disable_web_security
+        self.proxy = proxy
+        self.browser_args = browser_args
+        self.user_data_dir = (
+            user_data_dir  # Ignored if using shared pool, but kept for compatibility
+        )
+        self.process = None
+        self.ws = None
+        self.session = None
+        self.target_id = None
+        self.id_counter = 0
+        self._receive_task = None
+        self._pending_requests: Dict[int, asyncio.Future] = {}
+        self._event_handlers: Dict[str, List[asyncio.Future]] = {}
+        self._event_queues: Dict[str, List[asyncio.Queue]] = {}
+        # When set, only these CDP event methods are dispatched to handlers
+        # and queues (e.g. {"Network.webSocketFrameReceived"}). Responses to
+        # pending calls are always delivered regardless of this filter.
+        self._event_filter: Optional[set] = None
+        self._closing = False
+        self._connection_lost = False
+        self._shared_browser_ref_acquired = False
+        # True when this session runs through the browser-extension relay
+        # (g4f/api/cdp_relay.py) instead of a local Chrome CDP port.
+        self._via_extension = False
+        # True when this session is attached to the Android app's WebView
+        # (browser_mode="webview") instead of a local Chrome CDP port.
+        self._via_webview = False
+        self._webview_initial_url: Optional[str] = None
+        # WebView automation target bookkeeping: the DevTools socket name, the
+        # bridge id of the dedicated automation WebView created for this
+        # session (None when falling back to the chat UI page) and the target
+        # id of the chat UI page used for bridge calls.
+        self._webview_socket: Optional[str] = None
+        self._webview_automation_id: Optional[str] = None
+        self._webview_control_id: Optional[str] = None
+
+        # True when this session runs on a browser-level CDP WebSocket
+        # (e.g. Lightpanda) with a flat session created via
+        # Target.attachToTarget, instead of a per-page /devtools/page URL.
+        self._via_browser_socket = False
+        # Flat CDP session id on the browser-level socket (see above).
+        self._cdp_session_id: Optional[str] = None
+
+        # Network event loggers
+        self.network_requests: List[dict] = []
+        self.network_responses: List[dict] = []
+
+    @property
+    def is_alive(self) -> bool:
+        """Return True if the WebSocket is still connected and not closing."""
+        return not self._closing and not self._connection_lost and self.ws is not None and not self.ws.closed
+
+    async def start(self):
+        try:
+            result = await self._start()
+        except BaseException:
+            await self.close()
+            raise
+        if self.target_id:
+            _open_sessions[self.target_id] = self
+        return result
+
+    async def _start(self):
+        """Connect a CDP target: Android WebView, extension relay or shared Chrome."""
+        browser_mode = getattr(BrowserConfig, "browser_mode", None)
+        # Extension mode: route through the g4f browser extension relay
+        # (g4f/api/cdp_relay.py) instead of a local Chrome CDP port.
+        if browser_mode == "extension":
+            return await self._start_via_extension()
+
+        # WebView mode: attach to the Android app's own WebView through its
+        # DevTools socket — there is no installable Chrome on Android. Forced
+        # with G4F_BROWSER_MODE=webview, auto-detected on Android when no
+        # explicit CDP port is configured.
+        if browser_mode == "webview" or (
+            browser_mode is None and self.port is None and _is_android()
+        ):
+            return await self._start_via_webview()
+
+        # Reserve the browser before looking it up so an idle timer cannot
+        # close it between lookup and creating the tab.
+        acquire_shared_browser_ref()
+        self._shared_browser_ref_acquired = True
+        if self.port is None:
+            self.port = get_shared_browser(
+                self.host, self.port, self.headless, self.proxy, self.browser_args, self.disable_web_security,
+            )
+
+        # Create a new tab target
+        ws_url = None
+        for _ in range(10):
+            try:
+                req = urllib.request.Request(
+                    f"http://{self.host}:{self.port}/json/new", method="PUT"
+                )
+                with urllib.request.urlopen(req, timeout=2) as response:
+                    target = json.loads(response.read().decode("utf-8"))
+                    ws_url = target.get("webSocketDebuggerUrl")
+                    self.target_id = target.get("id")
+                    if ws_url:
+                        break
+            except urllib.error.HTTPError as e:
+                # The server is reachable but does not implement /json/new
+                # (e.g. Lightpanda only exposes the browser-level WebSocket
+                # and an empty /json/list). Retrying is pointless — create
+                # the target via CDP instead.
+                debug.log(
+                    f"CDP: /json/new not supported (HTTP {e.code}) — "
+                    f"falling back to browser-level WebSocket"
+                )
+                break
+            except Exception:
+                await asyncio.sleep(0.5)
+
+        if not ws_url:
+            # No per-page target via HTTP — try the browser-level WebSocket,
+            # where targets are created via CDP itself.
+            try:
+                return await self._start_via_browser_socket()
+            except Exception as e:
+                raise RuntimeError(
+                    f"Failed to create new tab target on port {self.port}: {e}"
+                ) from e
+
+        await self.connect(ws_url)
+
+    async def connect(self, ws_url: str):
+        """Connect to the target WebSocket debugger."""
+        self.session = aiohttp.ClientSession()
+        self.ws = await self.session.ws_connect(ws_url)
+        self._closing = False
+
+        # Start receiver loop
+        self._receive_task = asyncio.create_task(self._receiver_loop())
+
+        # Enable essential domains
+        await self.call("Page.enable")
+        await self.call("DOM.enable")
+        await self.call("Runtime.enable")
+        await self.call("Network.enable")
+        await self.call("Emulation.setFocusEmulationEnabled", enabled=True)
+
+        # Force a desktop-sized viewport — the OS window size hint
+        # (--window-size) is not always honored by the window manager, which
+        # can leave the page narrow enough to trigger a site's mobile layout.
+        try:
+            await self.call(
+                "Emulation.setDeviceMetricsOverride",
+                width=1280,
+                height=800,
+                deviceScaleFactor=1,
+                mobile=False,
+            )
+        except Exception:
+            pass
+
+        # Anti-detect: Override User-Agent to remove "HeadlessChrome"
+        user_agent = await self.evaluate_js("navigator.userAgent")
+        if user_agent and "HeadlessChrome" in user_agent:
+            clean_ua = user_agent.replace("HeadlessChrome", "Chrome")
+            await self.call("Network.setUserAgentOverride", userAgent=clean_ua)
+
+        # Anti-detect: Inject Stealth Script
+        await self.call("Page.addScriptToEvaluateOnNewDocument", source=STEALTH_JS)
+
+    async def _start_via_browser_socket(self):
+        """
+        Connect through a browser-level CDP WebSocket.
+
+        Some CDP servers (e.g. Lightpanda) expose a single browser-level
+        WebSocket at ``ws://host:port/`` and no working /json/new HTTP
+        endpoint — /json/list stays empty because no targets exist yet.
+        Connect to the browser socket, create a target via CDP
+        (Target.createTarget) and attach to it with a flat session
+        (Target.attachToTarget, flatten=True). All later calls are routed
+        through the session id, so call()/evaluate/events work unchanged.
+        """
+        import aiohttp
+
+        ws_url = f"ws://{self.host}:{self.port}/"
+        self.session = aiohttp.ClientSession()
+        try:
+            self.ws = await self.session.ws_connect(ws_url)
+        except Exception as e:
+            await self.session.close()
+            self.session = None
+            raise RuntimeError(
+                f"CDP: cannot connect to browser WebSocket {ws_url}: {e}") from e
+
+        self._closing = False
+        self._receive_task = asyncio.create_task(self._receiver_loop())
+
+        try:
+            # Create the tab target via CDP — there is no /json/new endpoint.
+            # (target_id may already be set when /json/new answered without
+            # a webSocketDebuggerUrl.)
+            if not self.target_id:
+                result = await self.call("Target.createTarget", url="about:blank")
+                self.target_id = result.get("targetId")
+                if not self.target_id:
+                    raise RuntimeError("Target.createTarget returned no targetId")
+            # Attach with a flat session: commands and events are multiplexed
+            # on this socket and tagged with the returned sessionId.
+            result = await self.call(
+                "Target.attachToTarget", targetId=self.target_id, flatten=True
+            )
+            self._cdp_session_id = result.get("sessionId")
+            if not self._cdp_session_id:
+                raise RuntimeError("Target.attachToTarget returned no sessionId")
+        except Exception as e:
+            await self._close_browser_socket()
+            raise RuntimeError(
+                f"CDP: failed to create/attach target on {ws_url}: {e}") from e
+
+        self._via_browser_socket = True
+        debug.log(
+            f"CDP: attached to target {self.target_id} via browser-level "
+            f"WebSocket {ws_url} (session {self._cdp_session_id})"
+        )
+
+        # Enable essential domains — tolerate servers that lack some of them.
+        for method in ("Page.enable", "DOM.enable", "Runtime.enable", "Network.enable"):
+            try:
+                debug.log(f"CDP: enabling {method}")
+                await self.call(method)
+            except Exception as e:
+                debug.log(f"CDP: {method} not supported by browser-level socket: {e}")
+
+        # Load the cookies from the .har files in the cookies directory into
+        # the browser. Lightpanda rejects browser-level cookie commands
+        # (BrowserContextNotLoaded), so this has to run on an attached
+        # session. Its cookie store is per connection, so every session
+        # injects the cookies itself.
+        try:
+            await self.inject_har_cookies()
+        except Exception as e:
+            debug.log(f"CDP: failed to inject .har cookies: {e}")
+
+        # Anti-detect: mask the browser in the User-Agent. The g4f-copilot
+        # Lightpanda fork already reports a Chrome UA, but older builds report
+        # "Lightpanda/1.0" and ignore Network.setUserAgentOverride entirely;
+        # Emulation.setUserAgentOverride only changes the HTTP header, while
+        # navigator.userAgent needs a defineProperty script (verified live).
+        # Apply both so HTTP requests and JS probes see a Chrome UA.
+        try:
+            user_agent = await self.evaluate_js("navigator.userAgent")
+        except Exception:
+            user_agent = None
+        if user_agent and not user_agent.startswith("Mozilla/"):
+            debug.log(f"CDP: masking user agent {user_agent!r} as Chrome")
+            # 1. HTTP-level: every request from this target carries the UA.
+            try:
+                await self.call(
+                    "Network.setUserAgentOverride",
+                    userAgent=CHROME_USER_AGENT,
+                )
+            except Exception as e:
+                debug.log(f"CDP: Network.setUserAgentOverride not supported: {e}")
+
+            # 2. JS-level: navigator.userAgent / appVersion on every new document.
+            try:
+                await self.call(
+                    "Page.addScriptToEvaluateOnNewDocument",
+                    source=(
+                        "for (const prop of ['userAgent', 'appVersion', 'vendor']) {"
+                        "Object.defineProperty(navigator, prop, {"
+                        f"get: () => (prop != 'vendor' ? {json.dumps(CHROME_USER_AGENT)} : 'Google Inc.'),"
+                        "configurable: true});}" +
+                        STEALTH_JS
+                    ),
+                )
+            except Exception as e:
+                debug.log(f"CDP: Page.addScriptToEvaluateOnNewDocument not supported: {e}")
+            # 3. Current document (the script above only applies to future ones).
+            try:
+                await self.evaluate_js(
+                    "for (const prop of ['userAgent', 'appVersion']) {"
+                    "Object.defineProperty(navigator, prop, {"
+                    f"get: () => {json.dumps(CHROME_USER_AGENT)}, configurable: true}});}}"
+                    + STEALTH_JS
+                )
+            except Exception:
+                pass
+
+    async def _close_browser_socket(self):
+        """Tear down a browser-level socket session (best effort)."""
+        if self._receive_task:
+            self._receive_task.cancel()
+            self._receive_task = None
+        if self.ws:
+            try:
+                await self.ws.close()
+            except Exception:
+                pass
+            self.ws = None
+        if self.session:
+            try:
+                await self.session.close()
+            except Exception:
+                pass
+            self.session = None
+
+    async def _start_via_extension(self):
+        """
+        Connect through the g4f browser extension relay.
+
+        Instead of http://host:port/json/new + a direct Chrome WebSocket,
+        ask the relay (running inside the g4f API server) to create a tab in
+        the extension's browser, then use the relay's pass-through WebSocket
+        /v1/cdp/ws/{target_id}. Everything else (call/evaluate/event loop)
+        works unchanged because the relay speaks plain CDP WebSocket.
+        """
+        import aiohttp
+
+        api_host = os.environ.get("G4F_API_HOST", "127.0.0.1")
+        api_port = os.environ.get("G4F_API_PORT", "1337")
+        base = f"http://{api_host}:{api_port}"
+
+        # 1. Create a tab in the extension's browser via the relay.
+        import urllib.request
+
+        req = urllib.request.Request(
+            f"{base}/json/new", method="PUT",
+            data=b"", headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as response:
+            target = json.loads(response.read().decode("utf-8"))
+        target_id = target.get("id")
+        if not target_id:
+            raise RuntimeError("CDP relay: failed to create extension tab")
+
+        self.target_id = target_id
+        self._via_extension = True
+
+        # 2. Connect to the relay's pass-through WebSocket for this target.
+        ws_url = f"ws://{api_host}:{api_port}/v1/cdp/ws/{quote_plus(target_id)}"
+        self.session = aiohttp.ClientSession()
+        self.ws = await self.session.ws_connect(ws_url)
+        self._closing = False
+        self._receive_task = asyncio.create_task(self._receiver_loop())
+
+        # 3. Enable essential domains (same as local mode).
+        await self.call("Page.enable")
+        await self.call("DOM.enable")
+        await self.call("Runtime.enable")
+        await self.call("Network.enable")
+
+    async def _start_via_webview(self):
+        """
+        Run automation in a dedicated WebView of the Android app.
+
+        The app's chat UI WebView exposes a JS bridge (window.G4FAutomation)
+        that creates additional WebViews on demand. Each one appears as its
+        own "page" target on the app's DevTools socket
+        ``@webview_devtools_remote_<pid>``, is shown in front of the chat UI
+        (with a close button) and can be attached via a WebSocket (aiohttp
+        UnixConnector). Everything else (call/evaluate/events) works
+        unchanged, because the WebView speaks plain CDP.
+
+        Without the bridge (older app builds) this falls back to attaching to
+        the chat UI page itself.
+        """
+        import aiohttp
+
+        if not _enable_webview_debugging():
+            raise RuntimeError(
+                "CDP: could not enable WebView debugging — not running inside the Android app?"
+            )
+
+        socket_name = _find_webview_devtools_socket()
+        # The DevTools socket appears shortly after debugging is enabled.
+        targets = None
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            try:
+                targets = _webview_devtools_request(socket_name, "/json/list")
+                if isinstance(targets, list) and targets:
+                    break
+            except Exception:
+                pass
+            await asyncio.sleep(0.5)
+        if not targets or not isinstance(targets, list):
+            raise RuntimeError(
+                f"CDP: no WebView DevTools targets on socket @{socket_name}"
+            )
+        self._webview_socket = socket_name
+
+        pages = [t for t in targets if t.get("type") == "page"]
+        if not pages:
+            raise RuntimeError(f"CDP: no page target in WebView DevTools: {targets}")
+        # The app's chat UI acts as the control page for the automation bridge.
+        control = next((t for t in pages if _is_control_page(t)), None)
+
+        # Prefer a dedicated automation WebView (a new CDP target) created via
+        # the app's JS bridge: it is shown in front of the chat UI and keeps
+        # the chat UI itself untouched. Parallel sessions each get their own.
+        target = None
+        if control is not None:
+            target = await self._create_webview_target(socket_name, control, targets)
+
+        if target is None:
+            # Fallback: attach to the app's chat UI page directly.
+            target = control if control is not None else pages[0]
+            debug.log("CDP: no automation bridge — attaching to the chat UI page")
+
+        ws_path = urlparse(target.get("webSocketDebuggerUrl", "")).path
+        if not ws_path:
+            ws_path = f"/devtools/page/{target.get('id')}"
+        self.target_id = target.get("id")
+        self._webview_initial_url = target.get("url")
+        self._via_webview = True
+        debug.log(
+            f"CDP: attached to Android WebView target {self.target_id} "
+            f"({self._webview_initial_url}) via @{socket_name}"
+        )
+
+        connector = aiohttp.UnixConnector(path="\0" + socket_name)
+        self.session = aiohttp.ClientSession(connector=connector)
+        self.ws = await self.session.ws_connect(f"ws://localhost{ws_path}")
+        self._closing = False
+        self._receive_task = asyncio.create_task(self._receiver_loop())
+
+        # Enable essential domains (no viewport/UA overrides — the WebView is
+        # a real, visible browser and the app already configured it).
+        await self.call("Page.enable")
+        await self.call("DOM.enable")
+        await self.call("Runtime.enable")
+        await self.call("Network.enable")
+
+    async def _create_webview_target(
+        self, socket_name: str, control: dict, known_targets: list
+    ) -> Optional[dict]:
+        """Create a dedicated automation WebView (new CDP target) via the app's
+        JS bridge and return its DevTools target. Returns None when the bridge
+        is unavailable or the target never shows up."""
+        known_ids = {t.get("id") for t in known_targets}
+        try:
+            automation_id = await _webview_bridge_call(
+                socket_name, control,
+                "(window.G4FAutomation && window.G4FAutomation.createTarget('about:blank')) || null",
+            )
+        except Exception as e:
+            debug.log(f"CDP: WebView bridge createTarget failed: {e}")
+            return None
+        if not isinstance(automation_id, str) or not automation_id:
+            return None
+
+        # Wait for the new WebView to appear as a page target on the socket.
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            try:
+                fresh = _webview_devtools_request(socket_name, "/json/list")
+                new_pages = [
+                    t for t in (fresh or [])
+                    if isinstance(t, dict)
+                    and t.get("type") == "page"
+                    and t.get("id") not in known_ids
+                    and t.get("id") not in _webview_claimed_targets
+                ]
+                if new_pages:
+                    target = new_pages[0]
+                    _webview_claimed_targets.add(target.get("id"))
+                    self._webview_automation_id = automation_id
+                    self._webview_control_id = control.get("id")
+                    debug.log(
+                        f"CDP: created automation WebView target {target.get('id')} "
+                        f"(bridge id {automation_id})"
+                    )
+                    return target
+            except Exception:
+                pass
+            await asyncio.sleep(0.25)
+
+        # Target never showed up — destroy the stray WebView again.
+        debug.log("CDP: automation WebView target did not appear — cleaning up")
+        try:
+            await _webview_bridge_call(
+                socket_name, control,
+                "window.G4FAutomation && window.G4FAutomation.closeTarget(%s)"
+                % json.dumps(automation_id),
+            )
+        except Exception:
+            pass
+        return None
+
+    async def _close_webview_target(self):
+        """Tear down this webview-mode session.
+
+        Dedicated automation WebViews (created through the app's JS bridge)
+        are destroyed via the bridge — the app removes them from the UI and
+        disables WebView debugging when the last one is closed. Fallback
+        sessions attached to the chat UI only navigate back, and debugging is
+        disabled when no other page target is left.
+        """
+        if self._webview_automation_id:
+            _webview_claimed_targets.discard(self.target_id)
+            control = None
+            try:
+                targets = _webview_devtools_request(self._webview_socket, "/json/list")
+                pages = [
+                    t for t in (targets or [])
+                    if isinstance(t, dict) and t.get("type") == "page"
+                ]
+                control = next(
+                    (t for t in pages if t.get("id") == self._webview_control_id),
+                    next((t for t in pages if _is_control_page(t)), None),
+                )
+            except Exception:
+                pass  # Socket gone — debugging already disabled (last target closed)
+            if control is not None:
+                try:
+                    await _webview_bridge_call(
+                        self._webview_socket, control,
+                        "window.G4FAutomation && window.G4FAutomation.closeTarget(%s)"
+                        % json.dumps(self._webview_automation_id),
+                    )
+                except Exception as e:
+                    debug.log(f"CDP: WebView bridge closeTarget failed: {e}")
+        else:
+            # Fallback: the target is the app's chat UI — never close it.
+            # Navigate back to the page the WebView showed before automation.
+            if (
+                self._webview_initial_url
+                and self.ws
+                and not self.ws.closed
+                and not self._connection_lost
+            ):
+                try:
+                    await asyncio.wait_for(
+                        self.call("Page.navigate", url=self._webview_initial_url),
+                        timeout=3.0,
+                    )
+                except Exception:
+                    pass
+            # Disable WebView debugging when this was the only page left.
+            try:
+                targets = _webview_devtools_request(self._webview_socket, "/json/list")
+                pages = [
+                    t for t in (targets or [])
+                    if isinstance(t, dict) and t.get("type") == "page"
+                ]
+                if len(pages) <= 1:
+                    _disable_webview_debugging()
+            except Exception:
+                pass  # Socket gone — debugging already disabled
+
+    def _dispatch_message(self, data: dict):
+        """Route a decoded CDP message to pending calls and event listeners."""
+        if "id" in data:
+            req_id = data["id"]
+            if req_id in self._pending_requests:
+                fut = self._pending_requests[req_id]
+                if not fut.done():
+                    if "error" in data:
+                        fut.set_exception(RuntimeError(data["error"]))
+                    else:
+                        fut.set_result(data.get("result", {}))
+        elif "method" in data:
+            method = data["method"]
+            params = data.get("params") or {}
+
+            # Flat session mode (browser-level socket): ignore events from
+            # other sessions. Browser-level events carry no sessionId.
+            if self._cdp_session_id is not None:
+                sid = data.get("sessionId")
+                if sid is not None and sid != self._cdp_session_id:
+                    return
+
+            # Skip events the session does not need — keeps the receiver
+            # cheap when a provider only listens to a few event types.
+            if self._event_filter is not None and method not in self._event_filter:
+                return
+
+            # Intercept network events
+            if method == "Network.requestWillBeSent":
+                self.network_requests.append(params)
+            elif method == "Network.responseReceived":
+                self.network_responses.append(params)
+
+            # Resolve any futures waiting for this event
+            if method in self._event_handlers:
+                for fut in self._event_handlers[method]:
+                    if not fut.done():
+                        fut.set_result(params)
+                self._event_handlers[method].clear()
+
+            if method in self._event_queues:
+                event = {"_method": method, **params}
+                for q in self._event_queues[method]:
+                    try:
+                        q.put_nowait(event)
+                    except asyncio.QueueFull:
+                        logger.debug("CDP: event queue full — dropping event")
+
+    async def _receiver_loop(self):
+        """Listen for WebSocket messages.
+
+        A single malformed or unexpected message must never kill the
+        receiver: parse and dispatch errors are logged and skipped, so the
+        session stays alive for subsequent events.
+        """
+        try:
+            async for msg in self.ws:
+                if msg.type == aiohttp.WSMsgType.TEXT:
+                    raw = msg.data
+                elif msg.type == aiohttp.WSMsgType.BINARY:
+                    raw = msg.data.decode("utf-8", errors="replace")
+                elif msg.type in (
+                    aiohttp.WSMsgType.CLOSE,
+                    aiohttp.WSMsgType.CLOSING,
+                    aiohttp.WSMsgType.CLOSED,
+                ):
+                    break
+                elif msg.type == aiohttp.WSMsgType.ERROR:
+                    logger.error(f"CDP receiver loop error: {msg.data}")
+                    continue
+                else:
+                    continue  # ping/pong and other control frames
+                try:
+                    data = json.loads(raw)
+                except (json.JSONDecodeError, TypeError) as e:
+                    logger.debug(f"CDP: dropping malformed message: {e}")
+                    continue
+                if not isinstance(data, dict):
+                    logger.debug(f"CDP: dropping non-object message: {str(data)[:100]}")
+                    continue
+                try:
+                    self._dispatch_message(data)
+                except Exception as e:
+                    logger.debug(f"CDP: error dispatching message: {e}")
+        except asyncio.CancelledError:
+            pass  # Normal shutdown via close()
+        except Exception as e:
+            if not self._closing:
+                logger.error(f"CDP receiver loop error: {e}")
+        finally:
+            self._connection_lost = True
+
+    async def call(self, method: str, _browser_level: bool = False, **params) -> dict:
+        """Call a CDP method and wait for its result.
+
+        On a browser-level socket (flat session mode) the call is routed to
+        the attached session via its sessionId — except ``Target.*`` commands
+        (and calls marked ``_browser_level``), which operate on the browser.
+        """
+        if not self.ws:
+            raise RuntimeError("CDPSession is not connected")
+        if self._connection_lost or self.ws.closed:
+            raise ConnectionError("CDPSession connection lost (browser closed?)")
+
+        self.id_counter += 1
+        req_id = self.id_counter
+
+        fut = asyncio.get_running_loop().create_future()
+        self._pending_requests[req_id] = fut
+
+        payload = {"id": req_id, "method": method, "params": _sanitize_cdp_params(params)}
+        if (
+            self._cdp_session_id
+            and not _browser_level
+            and not method.startswith("Target.")
+        ):
+            payload["sessionId"] = self._cdp_session_id
+        try:
+            await self.ws.send_json(payload)
+        except Exception as e:
+            self._connection_lost = True
+            self._pending_requests.pop(req_id, None)
+            raise ConnectionError(f"CDPSession connection lost during send: {e}")
+
+        try:
+            return await asyncio.wait_for(fut, timeout=30.0)
+        except asyncio.TimeoutError:
+            raise TimeoutError(f"CDP call {method} timed out after 30 seconds")
+        finally:
+            self._pending_requests.pop(req_id, None)
+
+    async def wait_for_event(self, method: str, timeout: float = 30.0) -> dict:
+        """Wait for a specific CDP event to fire (one-time)."""
+        fut = asyncio.get_running_loop().create_future()
+        if method not in self._event_handlers:
+            self._event_handlers[method] = []
+        self._event_handlers[method].append(fut)
+
+        try:
+            return await asyncio.wait_for(fut, timeout=timeout)
+        except asyncio.TimeoutError:
+            self._event_handlers[method].remove(fut)
+            raise TimeoutError(f"Timeout waiting for event {method}")
+
+    def add_event_handler(self, method: str, queue: asyncio.Queue):
+        """Add a persistent event listener that pushes events to an asyncio.Queue."""
+        if method not in self._event_queues:
+            self._event_queues[method] = []
+        self._event_queues[method].append(queue)
+
+    def set_event_filter(self, methods: Optional[List[str]]):
+        """Restrict event dispatch to the given CDP event methods.
+
+        Pass ``None`` to receive all events again. Responses to pending
+        calls are unaffected by this filter.
+        """
+        self._event_filter = set(methods) if methods is not None else None
+
+    def remove_event_handler(self, method: str, queue: asyncio.Queue):
+        """Remove a persistent event listener."""
+        if method in self._event_queues and queue in self._event_queues[method]:
+            self._event_queues[method].remove(queue)
+
+    async def evaluate_js(self, expression: str, returnByValue: bool = True, awaitPromise: bool = True) -> Any:
+        """Execute JavaScript and return the value."""
+        res = await self.call(
+            "Runtime.evaluate", expression=expression, returnByValue=returnByValue, awaitPromise=awaitPromise
+        )
+        if res.get("result", {}).get("type") == "undefined":
+            return None
+        if "result" not in res or "value" not in res["result"]:
+            raise RuntimeError(f"JavaScript evaluation failed: {res}")
+        return res.get("result", {}).get("value")
+
+    async def wrapped_js(self, expression: str) -> str:
+        return await self.evaluate_js(f"(async () => {{ {expression}; }})()")
+
+    async def get_cookies(self, urls: Optional[List[str]] = None) -> dict:
+        """Retrieve all cookies from the browser as a name-value dict."""
+        cookies = await self.get_cookies_list(urls=urls)
+        return {c["name"]: c["value"] for c in cookies}
+
+    async def get_cookies_list(self, urls: Optional[List[str]] = None) -> List[dict]:
+        """Retrieve full cookie objects from the browser session."""
+        params = {}
+        if urls:
+            params["urls"] = urls
+        res = await self.call("Network.getCookies", **params)
+        return res.get("cookies", [])
+
+    async def set_cookies(self, cookies: List[dict]):
+        """Set cookies in the browser session."""
+        for cookie in cookies:
+            params = {
+                "name": cookie.get("name"),
+                "value": cookie.get("value"),
+                "domain": cookie.get("domain"),
+                "path": cookie.get("path"),
+                "secure": cookie.get("secure"),
+                "httpOnly": cookie.get("httpOnly"),
+                "sameSite": cookie.get("sameSite"),
+                "expires": cookie.get("expires"),
+            }
+            params = {k: v for k, v in params.items() if v is not None}
+            await self.call("Network.setCookie", **params)
+
+    async def set_cookies_bulk(self, cookies: List[dict]) -> int:
+        """Set many cookies at once, falling back to one call per cookie.
+
+        ``Network.setCookies`` is a single round trip, which matters on
+        Lightpanda where every command is serialized. Servers that do not
+        implement it (or reject the batch) fall back to ``set_cookies``.
+        """
+        cookies = [c for c in cookies if c.get("name") and c.get("value") is not None]
+        if not cookies:
+            return 0
+        try:
+            await self.call("Network.setCookies", cookies=cookies)
+            return len(cookies)
+        except Exception as e:
+            debug.log(f"CDP: Network.setCookies failed ({e}) — setting cookies individually")
+        count = 0
+        for cookie in cookies:
+            try:
+                await self.set_cookies([cookie])
+                count += 1
+            except Exception as e:
+                debug.log(f"CDP: failed to set cookie {cookie.get('name')!r}: {e}")
+        return count
+
+    async def inject_har_cookies(self, dir_path: Optional[str] = None) -> int:
+        """Load the cookies from the .har files in the cookies directory.
+
+        Returns the number of cookies that were set. Lightpanda keeps its
+        cookie store per connection, so this runs for every session.
+        """
+        cookies = read_har_cookies(dir_path)
+        debug.log(f"CDP: found {len(cookies)} cookies in .har files")
+        if not cookies:
+            return 0
+        count = await self.set_cookies_bulk(cookies)
+        debug.log(f"CDP: injected {count}/{len(cookies)} cookies from .har files")
+        return count
+
+    async def get_user_agent(self) -> str:
+        """Retrieve the current browser user agent."""
+        return await self.evaluate_js("navigator.userAgent")
+
+    async def navigate(self, url: str):
+        """Navigate to a URL and wait for it to load."""
+
+        await self.call("Page.navigate", url=url)
+        await self.wait_for_load()
+
+    async def reload(self):
+        """Reload the current page and wait for it to load."""
+
+        await self.call("Page.reload")
+        await self.wait_for_load()
+
+    async def wait_for_load(self):
+        # Attach the listener and check readiness in a single evaluation so a
+        # page that already finished loading (or loads while we evaluate)
+        # resolves immediately instead of waiting for a 'load' event that
+        # never fires.
+        await self.evaluate_js("""
+            new Promise(resolve => {
+                if (document.readyState === 'complete') return resolve();
+                window.addEventListener('load', () => resolve(), {once: true});
+                setTimeout(resolve, 10000);
+            })
+        """)
+
+    async def wait_for_network_idle(
+        self, idle_time: float = 0.5, timeout: float = 15.0
+    ) -> bool:
+        """Wait until network activity settles (no requests for *idle_time* seconds).
+
+        Uses Network.requestWillBeSent / Network.loadingFinished events to track
+        in-flight requests. Returns True if the network went idle, False on timeout.
+        """
+        queue: asyncio.Queue = asyncio.Queue()
+        self.add_event_handler("Network.requestWillBeSent", queue)
+        self.add_event_handler("Network.loadingFinished", queue)
+        self.add_event_handler("Network.loadingFailed", queue)
+
+        # Count currently in-flight requests via JS-free CDP approach:
+        # Every requestWillBeSent increments, every loadingFinished/loadingFailed decrements.
+        pending = 0
+        deadline = time.monotonic() + timeout
+        last_activity = time.monotonic()
+
+        try:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+
+                idle_remaining = idle_time - (time.monotonic() - last_activity)
+                wait_for = min(remaining, max(0.05, idle_remaining))
+
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=wait_for)
+                    method = event.get("_method", "")
+                    if method == "Network.requestWillBeSent":
+                        pending += 1
+                        last_activity = time.monotonic()
+                    elif method in ("Network.loadingFinished", "Network.loadingFailed"):
+                        pending = max(0, pending - 1)
+                        last_activity = time.monotonic()
+                except asyncio.TimeoutError:
+                    pass
+
+                if pending == 0 and (time.monotonic() - last_activity) >= idle_time:
+                    return True
+        finally:
+            self.remove_event_handler("Network.requestWillBeSent", queue)
+            self.remove_event_handler("Network.loadingFinished", queue)
+            self.remove_event_handler("Network.loadingFailed", queue)
+
+    async def mouse_move(self, x: int, y: int):
+        """Simulate a mouse movement to the given coordinates."""
+        await self.call("Input.dispatchMouseEvent", type="mouseMoved", x=x, y=y)
+
+    async def click(self, x: int, y: int, delay: float = 0.05):
+        """Simulate a realistic mouse click at the given coordinates."""
+        await self.mouse_move(x, y)
+        await asyncio.sleep(0.02)
+        await self.call(
+            "Input.dispatchMouseEvent",
+            type="mousePressed",
+            button="left",
+            clickCount=1,
+            x=x,
+            y=y,
+        )
+        await asyncio.sleep(delay)
+        await self.call(
+            "Input.dispatchMouseEvent",
+            type="mouseReleased",
+            button="left",
+            clickCount=1,
+            x=x,
+            y=y,
+        )
+
+    async def click_turnstile_checkbox(self) -> bool:
+        """Find the Cloudflare Turnstile iframe on the page and click its center."""
+
+        js_code = """
+        (() => {
+            const iframes = document.querySelectorAll('iframe');
+            let cfIframe = null;
+            for (let iframe of iframes) {
+                if (iframe.src && iframe.src.includes('challenges.cloudflare.com')) {
+                    cfIframe = iframe;
+                    break;
+                }
+            }
+            if (!cfIframe) return null;
+            
+            const rect = cfIframe.getBoundingClientRect();
+            return {
+                x: rect.left + window.scrollX,
+                y: rect.top + window.scrollY,
+                width: rect.width,
+                height: rect.height
+            };
+        })()
+        """
+        try:
+            rect = await self.evaluate_js(js_code)
+            if rect and isinstance(rect, dict) and rect.get("width", 0) > 0:
+                # Center of the Turnstile checkbox (usually left aligned in the iframe)
+                center_x = int(rect["x"] + rect["width"] / 4)
+                center_y = int(rect["y"] + rect["height"] / 2)
+
+                await self.click(center_x, center_y)
+                return True
+        except Exception as e:
+            logger.debug(f"Failed to auto-click Turnstile: {e}")
+        return False
+
+    async def include_debug(self) -> bool:
+        """Inject a debug script into the page to enable logging."""
+        js_code = """
+    // Inject debug script to show logging
+    const debugEl = document.createElement('script');
+    debugEl.src = 'https://g4f.dev/dist/js/debug.js';
+    document.head.appendChild(debugEl);
+    """
+        try:
+            await self.evaluate_js(js_code)
+            return True
+        except Exception as e:
+            logger.debug(f"Failed to include debug script: {e}")
+        return False
+
+    async def click_button_by_text(self, texts: list[str] = [
+        'Send', 'Accept', 'Accept all', 'Accept All',
+        'Accept All Cookies', 'Accept all cookies',
+        'Einwilligen', 'Alle akzeptieren',
+        'Zustimmen und weiter', 'Zustimmen',
+        'Run', 'Accept Cookies', 'Skip for now'
+    ]) -> bool:
+        """Find and click a button by its visible text, including inside iframes."""
+
+        js_code = f"""
+const params = new URLSearchParams(window.location.search || document.location.hash.substring(1));
+const targetTexts = [
+    ...{json.dumps(texts)},
+    ...params.getAll('click')
+];
+const acceptBtns = (() => {{
+    function searchDocument(doc, offsetX = 0, offsetY = 0) {{
+        const foundButtons = [];
+        try {{
+            if (!doc) return [];
+
+            // 1. Search buttons in the current document
+            const buttons = doc.querySelectorAll('button, input[type="submit"], [role="button"], a, h2');
+            for (let button of buttons) {{
+                const text = (button.innerText || button.value || button.textContent || '').trim();
+                if (targetTexts.includes(text)) {{
+                    foundButtons.push(button);
+                }}
+            }}
+
+            // 2. Search inside nested iframes
+            const iframes = doc.querySelectorAll('iframe');
+            for (let iframe of iframes) {{
+                try {{
+                    const iframeDoc = iframe.contentDocument || iframe.contentWindow?.document;
+                    if (iframeDoc) {{
+                        const iframeRect = iframe.getBoundingClientRect();
+                        const btns = searchDocument(
+                            iframeDoc,
+                            offsetX + iframeRect.left,
+                            offsetY + iframeRect.top
+                        );
+                        if (btns.length > 0) {{
+                            foundButtons.push(...btns);
+                        }}
+                    }}
+                }} catch (e) {{
+                    // Cross-origin iframe security restriction
+                }}
+            }}
+        }} catch (e) {{
+            console.error('Error searching for accept buttons:', e);
+        }}
+        return foundButtons;
+    }}
+
+    return searchDocument(document, window.scrollX, window.scrollY);
+}})();
+const clickedTexts = [];
+if (acceptBtns && acceptBtns.length > 0) {{
+    acceptBtns.forEach(btn => {{
+        try {{
+            btn.click();
+            clickedTexts.push(btn.innerText || btn.value || btn.textContent || '');
+        }} catch (e) {{
+            console.error('Failed to click accept button:', e);
+        }}
+    }});
+}}
+return clickedTexts.join(', ');
+"""
+        return await self.wrapped_js(
+            js_code
+        )
+
+    async def insert_text_and_submit(self, text = "") -> bool:
+        """Insert text into the appropriate input field and submit it."""
+
+        js_code = """
+// Get the current URL's search parameters
+const params = new URLSearchParams(window.location.search || document.location.hash.substring(1));
+"""
+        if text:
+            js_code += f"""
+const searchQuery = {json.dumps(text)};"""
+        else:
+            js_code += """
+const searchQuery = params.get('q');"""
+
+        js_code += """
+// Enable Google AI Mode if the URL has the ai-mode parameter
+let googleAiModeButton = null;
+function enableGoogleAiMode() {
+    // Enable Google AI Mode if the URL has the ai-mode parameter
+    const aiMode = params.has('ai-mode');
+    if (aiMode) {
+        googleAiModeButton = Array.from(document.querySelectorAll("a, button")).filter(a => {
+            return a.textContent.endsWith("KI‑Modus") || a.textContent.endsWith("AI Mode");
+        }).pop();
+        googleAiModeButton ? googleAiModeButton.click() : null;
+        setTimeout(() => {
+            googleAiModeButton ? googleAiModeButton.click() : null;
+        }, 1000);
+        return !!googleAiModeButton;
+    }
+    return false;
+}
+enableGoogleAiMode();
+
+// Find the textarea
+const fieldSelectors = [
+    'textarea[name="prompt"]',
+    '[class^="MessageInput__TextArea--"]',
+    '[placeholder="Type a message..."]',
+    '#chat-input', // # z.ai
+    '[contenteditable="true"]',
+    '[placeholder="Message DeepSeek"]',
+    '.message-input-textarea',
+    '[placeholder="Ask anything…"]', // arena.ai
+    '[placeholder="Ask Meta AI..."]', // meta.ai
+    '[placeholder="Ask anything..."]', // cloudflare
+    '[data-testid="textbox"]', // Flux HF
+    '[contenteditable="true"]', // copilot.microsoft.com
+];
+// Handle special cases for specific sites (like DeepSeek, Gemini, etc.)
+(function() {
+    if (!searchQuery) return;
+
+    const editor = document.querySelector(fieldSelectors.join(', '));
+    if (!editor) return;
+
+    // Focus the element first (some frameworks require this)
+    editor.focus();
+
+    // Use the document.execCommand approach
+    // This simulates real user typing and is the most likely way to trigger framework state
+    document.execCommand('selectAll', false, null);
+    document.execCommand('insertText', false, searchQuery);
+
+    // If that fails, force React/Vue state update
+    // This triggers the underlying setter that frameworks use
+    const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+        window.HTMLElement.prototype, 
+        'innerText'
+    ).set;
+
+    nativeInputValueSetter.call(editor, searchQuery);
+    
+    // Dispatch events to notify the framework
+    editor.dispatchEvent(new Event('keyup', { bubbles: true }));
+    editor.dispatchEvent(new Event('input', { bubbles: true }));
+    editor.dispatchEvent(new Event('change', { bubbles: true }));
+})();
+
+
+// Click the send / submit button if it exists
+const sendButtonSelectors = [
+    '[data-send-label="Send message"]',
+    '[class^="MessageInput__Submit--"]',
+    '.send-button-container',
+    '.send-button',
+    '#send-message-button', // z.ai
+    '[data-testid="chat-submit"]', // grok.com
+    '[aria-label="Send"]', // meta.ai
+    '#send-message-button', // z.ai
+    '[aria-label="Send message"]', // arena.ai / gemini.google.com
+    '[aria-label="Nachricht senden"]', // gemini.google.com
+    '[aria-label="Senden"]', // copilot.microsoft.com
+];
+const sendButton = document.querySelector(sendButtonSelectors.join(', '));
+setTimeout(() => {
+    // Search for new send button (copilot.microsoft.com)
+    const sendButton = document.querySelector(sendButtonSelectors.join(', '));
+    if (sendButton) {
+        sendButton.click();
+        setTimeout(() => {
+            sendButton.click();
+        }, 1000);
+    }
+}, 2000);
+
+// Click the send button on gemini.google.com
+const geminiSendButton = document.querySelector(`.send-button`);
+if (geminiSendButton) {   
+    setTimeout(() => {
+        geminiSendButton.dispatchEvent(new Event('click', {bubbles: true}));
+    }, 1000);
+}
+
+// Click the send button on chat.deepseek.com
+const deepseekSendButton = document.querySelector('[style="width: fit-content;"] [role="button"]');
+if (deepseekSendButton) {
+    deepseekSendButton.click();
+}
+
+// Return the text content of the first found send button for logging/debugging
+return (
+    sendButton || geminiSendButton || deepseekSendButton || googleAiModeButton
+)?.textContent.trim();
+"""
+        try:
+            text = await self.wrapped_js(js_code)
+            if text and isinstance(text, str):
+                debug.log(f"Clicked button with text: {text}")
+                return True
+        except Exception as e:
+            debug.error(f"Failed to click accept button:", e)
+        return False
+
+    async def bypass_turnstile(self):
+        """Execute a sequence of anti-detect actions to bypass Cloudflare Turnstile."""
+        import random
+
+        # 1. Force the tab to be active
+        if self.target_id:
+            try:
+                await self.call("Target.activateTarget", targetId=self.target_id)
+            except Exception:
+                pass
+
+        # 2. Simulate realistic mouse movements
+        start_x, start_y = random.randint(10, 50), random.randint(10, 50)
+        end_x, end_y = random.randint(300, 600), random.randint(200, 500)
+
+        steps = 5
+        for i in range(steps):
+            x = start_x + (end_x - start_x) * (i / steps) + random.randint(-5, 5)
+            y = start_y + (end_y - start_y) * (i / steps) + random.randint(-5, 5)
+            await self.mouse_move(int(x), int(y))
+            await asyncio.sleep(random.uniform(0.05, 0.1))
+
+        # 3. Try to click the specific Cloudflare Turnstile checkbox
+        clicked_cf = await self.click_turnstile_checkbox()
+
+        # 4. If Cloudflare iframe not found, click randomly to gain focus
+        if not clicked_cf:
+            await self.click(end_x, end_y)
+
+        # 5. Scroll down slightly
+        await self.evaluate_js(f"window.scrollBy(0, {random.randint(100, 300)})")
+        await asyncio.sleep(0.2)
+
+        # 6. Temporarily disable Network and Runtime interception to hide debugger overhead
+        try:
+            await self.call("Network.disable")
+            await self.call("Runtime.disable")
+            await asyncio.sleep(2)
+        finally:
+            await self.call("Network.enable")
+            await self.call("Runtime.enable")
+
+    async def capture_screenshot(self, url: str, n: int = 3) -> AsyncIterator[str]:
+        """Navigate to a URL and capture a screenshot, caching the result."""
+
+        url_without_suffix = url[:-7] if url.endswith("_2.webp") or url.endswith("_3.webp") else url
+        url_with_noads = f"{url_without_suffix}&noads={int(time.time())}" if "?" in url_without_suffix else f"{url_without_suffix}?noads={int(time.time())}"
+        debug.log(f"Navigating to URL: {url_with_noads}")
+        await self.navigate(url_with_noads)
+
+        if await self.evaluate_js('!document.doctype'):
+            raise RuntimeError(f"Failed to load page {url} for screenshot, document.doctype={await self.evaluate_js('String(document.doctype)')}")
+
+        await self.bypass_turnstile()
+        await self.evaluate_js("window.scrollTo(0, 0);")
+        await self.include_debug()
+
+        result = None
+        for i in range(n):
+            await asyncio.sleep(1)
+            try:
+                result = await self._capture_screenshot_impl(url, n - i)
+                if url.endswith(f"_{n - i}.jpg"):
+                    return result
+            except Exception as e:
+                debug.error("Screenshot #{i+1} failed:", e)
+        return result
+
+#         response = await self.evaluate_js("""
+#         new Promise((resolve, reject) => {
+#         const html2canvasEL = document.createElement('script');
+# html2canvasEL.src = 'https://html2canvas.hertzen.com/dist/html2canvas.min.js';
+# html2canvasEL.onload = async () => {
+#     c=await html2canvas(document.body, {/*width: 1200, height: 630*/});
+#     c.toBlob(async (b)=>{
+#         const url = "https://media.pollinations.ai/upload";
+#         const formData = new FormData();
+#         formData.append('file', b);
+#         const response = await fetch(url, {
+#             method: 'POST',
+#             body: formData,
+#             headers: {"Authorization": "Bearer pk_7X0QLj0xijSd0xj7"}
+#         });
+#         resolve(await response.json())
+#     }, 'image/webp');
+# };
+# html2canvasEL.onerror = (e) => { reject(e); };
+# document.head.appendChild(html2canvasEL);
+#         """)
+#         async with aiohttp.ClientSession() as session:
+#             async with session.get(response['url']) as resp:
+#                 image_bytes = await resp.read()
+    
+    async def _capture_screenshot_impl(self, url: str, n: int) -> str:
+        url_without_suffix = url[:-7] if url.endswith("_2.webp") or url.endswith("_3.webp") else url
+        datekey = datetime.date.today().isoformat()
+        screenshot_dir = get_screenshot_dir(datekey)
+        # Use original URL for filename to distinguish between similar URLs
+        base_name = secure_filename(url_without_suffix.replace('https://', '').replace('http://', '').replace('www.', ''))
+        base_name = os.path.basename(base_name)
+        if not base_name:
+            base_name = hashlib.md5(url.encode()).hexdigest()
+        filename = f"{base_name}{'.webp' if n == 1 else f'_{n}.webp'}"
+        real_root = os.path.realpath(screenshot_dir)
+        filepath = os.path.realpath(os.path.join(screenshot_dir, filename))
+        if not filepath.startswith(real_root + os.sep):
+            raise ValueError("Unsafe screenshot path")
+        if os.path.exists(filepath):
+            debug.log(f"Screenshot already exists: {filepath}")
+            return filepath
+        # Wait for network activity to settle before capturing
+        await self.wait_for_network_idle(idle_time=5, timeout=15.0)
+        # Try to click any "Accept" or "Einwilligen" cookie consent buttons
+        if n < 3 and not "id=" in url_without_suffix:
+            for _ in range(2):
+                debug.log("Attempting to click accept button...")
+                await asyncio.sleep(1)
+                if await self.click_button_by_text():
+                    debug.log("Clicked accept button.")
+                if await self.insert_text_and_submit():
+                    debug.log("Inserted text and submitted.")
+                break
+        if ("headless=false" in url_without_suffix or "sleep=" in url_without_suffix or "wait=" in url_without_suffix) and n == 3:
+            debug.log("Waiting 5 seconds for page to settle due to sleep/wait parameter...")
+            await asyncio.sleep(120)
+        await self.wait_for_network_idle(idle_time=5, timeout=15.0)
+        result = await self.call("Page.captureScreenshot")
+        image_bytes = base64.b64decode(result["data"])
+
+        # Resize to 1200x630 and save as WebP to reduce file size
+        if has_pillow:
+            from io import BytesIO
+            image = Image.open(BytesIO(image_bytes))
+            image = image.resize((1200, 630), Image.Resampling.LANCZOS)
+            width, height = image.size
+            image = image.crop((0, 0, max(0, width - 14), height))
+            image = image.convert("RGB")
+            output = BytesIO()
+            image.save(output, format="WEBP", quality=85, method=6)
+            image_bytes = output.getvalue()
+        
+        Path(filepath).write_bytes(image_bytes)
+        return filepath
+
+    async def close(self):
+        """Close WebSocket session and close this tab only.
+
+        The shared browser process is kept alive as long as other CDP sessions
+        (tabs) are active.  When the last session releases its reference the
+        browser is terminated automatically.
+
+        In webview mode a dedicated automation WebView is destroyed through
+        the app's bridge — WebView debugging is disabled again when the last
+        automation target is closed. Fallback sessions (attached to the chat
+        UI) only navigate the WebView back to its initial URL.
+        """
+        if self.target_id and self.target_id in _open_sessions and self.is_alive:
+            info: dict = {"title": "", "url": "", "closed_at": time.time()}
+            try:
+                info["url"] = await asyncio.wait_for(self.evaluate_js("location.href"), 3)
+                info["title"] = await asyncio.wait_for(self.evaluate_js("document.title"), 3)
+            except Exception:
+                pass
+            info["html"] = await _snapshot_session(self)
+            _closed_sessions[self.target_id] = info
+            while len(_closed_sessions) > 50:
+                del _closed_sessions[next(iter(_closed_sessions))]
+        if self.target_id:
+            _open_sessions.pop(self.target_id, None)
+        self._closing = True
+
+        if self._via_webview:
+            await self._close_webview_target()
+
+        if self._via_browser_socket and self.target_id:
+            # Browser-level socket mode: there is no /json/close HTTP
+            # endpoint — close the target via CDP on the same socket.
+            try:
+                await asyncio.wait_for(
+                    self.call(
+                        "Target.closeTarget",
+                        targetId=self.target_id,
+                        _browser_level=True,
+                    ),
+                    timeout=5.0,
+                )
+            except Exception:
+                pass
+
+        if self._receive_task:
+            self._receive_task.cancel()
+
+        if self.ws:
+            try:
+                await self.ws.close()
+            except Exception:
+                pass
+            self.ws = None
+
+        if self.session:
+            await self.session.close()
+            self.session = None
+
+        if self.target_id:
+            if self._via_webview:
+                pass  # Automation WebView already destroyed via the app bridge.
+            elif self._via_extension:
+                # Extension mode: ask the relay to close the automation tab
+                # in the extension's browser (agent executes close_tab).
+                try:
+                    api_host = os.environ.get("G4F_API_HOST", "127.0.0.1")
+                    api_port = os.environ.get("G4F_API_PORT", "1337")
+                    urllib.request.urlopen(
+                        f"http://{api_host}:{api_port}/json/close/{self.target_id}",
+                        timeout=5,
+                    )
+                except Exception:
+                    pass
+            elif self._via_browser_socket:
+                pass  # Target already closed via CDP above.
+            elif self.port:
+                try:
+                    urllib.request.urlopen(
+                        f"http://{self.host}:{self.port}/json/close/{self.target_id}",
+                        timeout=2,
+                    )
+                except Exception:
+                    pass
+            self.target_id = None
+
+        # Release our tab; browser stays alive for reuse by other tabs.
+        # Extension/webview mode never acquired a shared-browser reference.
+        if self._shared_browser_ref_acquired:
+            self._shared_browser_ref_acquired = False
+            release_shared_browser_ref()
+
+    async def __aenter__(self):
+        await self.start()
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.close()

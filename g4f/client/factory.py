@@ -1,0 +1,216 @@
+from __future__ import annotations
+
+import json
+import requests
+from pathlib import Path
+from datetime import datetime
+from typing import Union, List, Dict, Type, Optional
+
+from ..providers.types import ProviderType, BaseProvider
+from ..errors import ProviderNotFoundError
+from ..Provider import ProviderUtils
+from ..Provider.template import OpenaiTemplate
+from ..config import get_cache_dir
+from ..config import AppConfig
+from .. import debug
+
+
+def create_custom_provider(
+    base_url: str,
+    api_key: Optional[str] = None,
+    name: Optional[str] = None,
+    working: bool = True,
+    default_model: str = "",
+    models: Optional[List[str]] = None,
+    **kwargs,
+) -> ProviderType:
+    """
+    Create a custom provider class based on OpenaiTemplate.
+
+    Args:
+        base_url: The base URL for the API (e.g., "https://api.example.com/v1")
+        api_key: Optional API key for authentication
+        name: Optional name for the provider (defaults to derived from base_url)
+        working: Whether the provider is working (default: True)
+        default_model: Default model to use
+        models: List of available models
+        **kwargs: Additional attributes to set on the provider class
+
+    Returns:
+        A custom provider class that extends OpenaiTemplate
+    """
+    if name is None:
+        # Derive name from base_url
+        from urllib.parse import urlparse
+
+        parsed = urlparse(base_url)
+        name = (
+            parsed.netloc.replace(".", "_").replace("-", "_").title().replace("_", "")
+        )
+        if not name:
+            name = "CustomProvider"
+
+    # Create a new class that extends OpenaiTemplate
+    class_attrs = {
+        "url": base_url,
+        "base_url": base_url.rstrip("/"),
+        "api_key": api_key,
+        "working": working,
+        "default_model": default_model,
+        "models": models or [],
+        **kwargs,
+    }
+
+    CustomProvider = type(name, (OpenaiTemplate,), class_attrs)
+    return CustomProvider
+
+
+class AbstractClientFactory:
+    # Registry of live/custom providers
+    _live_providers_url = "https://g4f.dev/dist/js/providers.json"
+    _live_providers: Dict[str, Dict] = {}
+    # Minimal registry used when the live provider list cannot be downloaded
+    # (offline device, blocked CDN, ...). Loading it must never fail: the
+    # built-in G4FSpace provider is resolved from it while ``g4f.gui`` is
+    # being imported, so an exception here broke the whole GUI at startup.
+    _fallback_live_providers: Dict[str, Dict] = {
+        "providers": {
+            "default": {"label": "default", "backupUrl": "https://g4f.space/v1"},
+        },
+        "defaultModels": {"default": "auto"},
+    }
+
+    @classmethod
+    def _fallback_registry(cls) -> Dict[str, Dict]:
+        return {
+            "providers": dict(cls._fallback_live_providers["providers"]),
+            "defaultModels": dict(cls._fallback_live_providers["defaultModels"]),
+        }
+
+    @classmethod
+    def _load_live_providers(cls, path: Path) -> Dict[str, Dict]:
+        """Load the live provider registry, preferring the daily cache.
+
+        Never blocks indefinitely and never raises: without a network the
+        minimal fallback registry is used instead.
+        """
+        try:
+            if path.exists():
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict) and data.get("providers"):
+                    return data
+        except (OSError, ValueError):
+            pass
+        try:
+            response = requests.get(cls._live_providers_url, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+        except (requests.RequestException, ValueError):
+            debug.log(f"Failed to load live providers from {cls._live_providers_url}")
+            return cls._fallback_registry()
+        if not isinstance(data, dict) or not data.get("providers"):
+            return cls._fallback_registry()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=4)
+        except OSError:
+            pass
+        return data
+
+    @classmethod
+    def create_provider(
+        cls,
+        name: Optional[str],
+        provider: Union[Type[BaseProvider], str],
+        base_url: Optional[str] = None,
+        api_key: Optional[str] = None,
+        **kwargs,
+    ) -> Type[BaseProvider]:
+        """
+        Register a live/custom provider that can be used by name.
+
+        Args:
+            name: Name to register the provider under
+            provider: Either a provider class or "custom" to create a custom provider
+            base_url: Base URL for custom providers
+            api_key: API key for custom providers
+            **kwargs: Additional arguments for custom provider creation
+
+        Returns:
+            The registered provider class
+        """
+        if not isinstance(provider, str):
+            return provider
+        elif provider.startswith("http://") or provider.startswith("https://"):
+            provider = create_custom_provider(provider, api_key, name=name, **kwargs)
+        elif provider.startswith("custom:"):
+            base_url = f"https://g4f.space/custom/{provider[7:]}"
+            if not api_key and not cls.is_provider_api_key(AppConfig.g4f_api_key):
+                api_key = AppConfig.g4f_api_key
+            provider = create_custom_provider(base_url, api_key, name=name, **kwargs)
+            provider.backup_url = base_url
+        elif provider in ProviderUtils.convert:
+            provider = ProviderUtils.convert[provider]
+        else:
+            if not cls._live_providers:
+                path = (
+                    Path(get_cache_dir())
+                    / ".models"
+                    / datetime.today().strftime("%Y-%m-%d")
+                    / f"providers.json"
+                )
+                path.parent.mkdir(parents=True, exist_ok=True)
+                cls._live_providers = cls._load_live_providers(path)
+            if provider in cls._live_providers.get("providers", {}):
+                config = cls._live_providers["providers"][provider]
+                if (
+                    "provider" in config
+                    and config.get("provider") in ProviderUtils.convert
+                ):
+                    return ProviderUtils.convert[config.get("provider")]
+                if (
+                    not api_key
+                    and not cls.is_provider_api_key(AppConfig.g4f_api_key)
+                    and config.get("backupUrl")
+                ):
+                    api_key = AppConfig.g4f_api_key
+                base_url = config.get("baseUrl", config.get("backupUrl"))
+                if not base_url:
+                    raise ValueError("No valid base URL found for provider.")
+                return create_custom_provider(
+                    base_url=base_url
+                    if cls.is_provider_api_key(api_key)
+                    or config.get("backupUrl") is None
+                    else base_url,
+                    backup_url=config.get("backupUrl"),
+                    api_key=api_key,
+                    name=provider,
+                    default_model=cls._live_providers["defaultModels"].get(
+                        provider, ""
+                    ),
+                )
+            else:
+                try:
+                    provider = ProviderUtils.get_by_label(provider)
+                except ValueError as e:
+                    from g4f.mcp.pa_provider import get_pa_registry
+
+                    registry = get_pa_registry()
+                    if provider:
+                        if provider.startswith("pa:"):
+                            provider = provider[3:]
+                        provider_cls = registry.get_provider_class(provider)
+                        if provider_cls:
+                            return provider_cls
+                    raise ProviderNotFoundError(str(e)) from e
+        return provider
+
+    @classmethod
+    def is_provider_api_key(cls, api_key: str) -> bool:
+        return (
+            api_key
+            and not api_key.startswith("g4f_")
+            and not api_key.startswith("gfs_")
+        )

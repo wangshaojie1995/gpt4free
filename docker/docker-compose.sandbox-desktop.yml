@@ -1,0 +1,63 @@
+# Sandbox desktop: TigerVNC + Xfce + noVNC + g4f API in one container.
+# The entrypoint starts Xvnc and Xfce automatically and exports DISPLAY, so a
+# browser opened from the desktop menu (Chrome) renders there.
+#   docker compose -f docker/docker-compose.sandbox-desktop.yml up -d
+# Desktop: http://127.0.0.1:8080/desktop/  (g4f-branded noVNC client -> Xvnc :0,
+#          served by the g4f API itself; index.html embeds it full-viewport)
+# API:     http://127.0.0.1:8080        (same server and port as the desktop)
+# Apps:    http://g4f.g4f.local/  (also <port>.g4f.local, e.g.
+#          http://20128.g4f.local/) — the entrypoint seeds /etc/hosts from
+#          g4f/api/domain_router.py, so no extra_hosts are needed here.
+#
+# The ports are published on SANDBOX_BIND_ADDR (default: 127.0.0.1, localhost),
+# not on every host interface. Set it to 0.0.0.0 to expose the desktop on the
+# LAN.
+#
+# The image also installs an egress firewall: containers can reach the public
+# internet but not private/link-local/reserved networks (the host LAN, other
+# Docker networks, cloud metadata), file-sharing protocols or crypto-mining
+# ports. Replies to connections coming in from the host are allowed, so the
+# published desktop/API ports stay reachable. It needs CAP_NET_ADMIN, added
+# below; set SANDBOX_BLOCK_LOCAL_NETWORK=0 to disable it. If the filter cannot
+# be installed, startup continues with a warning unless
+# SANDBOX_FIREWALL_STRICT=1 is set.
+#
+# Set SANDBOX_DESKTOP=0 in environment to skip the desktop stack.
+services:
+  sandbox-desktop:
+    image: g4f-sandbox:desktop
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile-sandbox-desktop
+      args:
+        # Match the host uid to avoid permission problems on bind mounts.
+        G4F_USER_ID: ${G4F_USER_ID:-1000}
+        # 1 = install this checkout as an editable g4f (serves the repo code);
+        # 0 (default) = keep only the PyPI g4f that g4f-go installs.
+        G4F_INSTALL_LOCAL: ${G4F_INSTALL_LOCAL:-0}
+    container_name: g4f-sandbox-desktop
+    hostname: sandbox
+    init: true
+    shm_size: 2gb
+    # iptables needs NET_ADMIN for the sandbox egress filter.
+    cap_add:
+      - NET_ADMIN
+    ports:
+      - "${SANDBOX_BIND_ADDR:-0.0.0.0}:8080:8080"   # g4f API server + noVNC desktop (custom routes /desktop/, /desktop/websockify)
+      - "${SANDBOX_BIND_ADDR:-0.0.0.0}:5900:5900"   # Xvnc display :0 (direct VNC clients)
+    volumes:
+      # Mount the app tree the API serves and the agents edit. Override with
+      # G4F_APP_DIR=/absolute/path (start-sandbox-desktop.sh --app-dir does).
+      - ${G4F_APP_DIR:-..}:/app/gpt4free
+    environment:
+      - XDG_RUNTIME_DIR=/tmp/sandbox-runtime
+      - SANDBOX_BLOCK_LOCAL_NETWORK=${SANDBOX_BLOCK_LOCAL_NETWORK:-1}
+      - SANDBOX_FIREWALL_STRICT=${SANDBOX_FIREWALL_STRICT:-0}
+      # Domain router: <app>.g4f.local (or the configured suffix) reaches the
+      # local apps through the API port.
+      - G4F_DOMAIN_SUFFIX=${G4F_DOMAIN_SUFFIX:-g4f.local}
+      - G4F_DOMAIN_ROUTER=${G4F_DOMAIN_ROUTER:-1}
+      # Optional password for the API, noVNC desktop and routed apps. The
+      # browser login accepts any username; the password is this key.
+      - G4F_API_KEY=${G4F_API_KEY:-}
+      # - SANDBOX_DESKTOP=0

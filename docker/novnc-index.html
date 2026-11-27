@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+    <meta name="theme-color" content="#0b0f14">
+    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="apple-mobile-web-app-title" content="g4f Desktop">
+    <title>g4f Sandbox Desktop</title>
+    <link rel="manifest" href="manifest.webmanifest">
+    <link rel="icon" href="g4f.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="g4f-controls.css">
+    <style>
+        html, body { height: 100%; margin: 0; background: #000; }
+        iframe { display: block; width: 100%; height: 100%; border: 0; }
+    </style>
+</head>
+<body>
+    <!-- Stock noVNC client, autoconnected, filling the page (no header of its
+         own). resize=remote asks the VNC server to resize the desktop to this
+         viewer's window, so phones, laptops and tablets all get a usable
+         picture; the Fit control in the overlay switches to local scaling for
+         viewers that prefer a fixed geometry. The g4f branding lives inside
+         the client itself: bin/novnc-brand.sh swaps the noVNC logos for
+         g4f.svg and applies the g4f colors at image build. -->
+    <iframe id="vnc" src="vnc.html?autoconnect=1&amp;resize=remote&amp;reconnect=true"
+            allow="clipboard-read; clipboard-write; fullscreen"
+            allowfullscreen title="g4f sandbox desktop (noVNC)"></iframe>
+
+    <!-- Touch controls copied from the Remote Desktop viewer: a text input,
+         modifier/navigation keys and one-tap desktop shortcuts. The controls
+         follow the on-screen keyboard (visualViewport) so the Send button and
+         the key rows stay reachable while typing. g4f-controls.js talks to the
+         noVNC client through the bridge that novnc-brand.sh installs in
+         app/ui.js. -->
+    <div id="handle" class="g4f-ui hidden" title="Show desktop controls"
+         role="button" tabindex="0" aria-label="Show desktop controls">&#9650;</div>
+
+    <div id="toolbar" class="g4f-ui">
+        <button id="btn-control" type="button" aria-pressed="false">
+            <span class="glyph">&#9995;</span><span id="control-label">View</span>
+        </button>
+        <button id="btn-shortcuts" type="button" aria-pressed="false">
+            <span class="glyph">&#8984;</span>Keys
+        </button>
+        <button id="btn-keyboard" type="button" aria-pressed="false">
+            <span class="glyph">&#9000;</span>Type
+        </button>
+        <button id="btn-quality" type="button">
+            <span class="glyph">&#9679;</span><span id="quality-label">med</span>
+        </button>
+        <button id="btn-fit" type="button" aria-pressed="false">
+            <span class="glyph">&#9635;</span>Fit
+        </button>
+        <button id="btn-fullscreen" type="button">
+            <span class="glyph">&#9974;</span>Full
+        </button>
+        <button id="btn-install" class="hidden" type="button">
+            <span class="glyph">&#8681;</span>Install
+        </button>
+        <button id="btn-disconnect" type="button">
+            <span class="glyph">&#10005;</span>Leave
+        </button>
+    </div>
+
+    <div id="keyboard" class="g4f-ui">
+        <div class="row tight">
+            <input id="text-input" type="text" placeholder="Type here, then press Send" autocomplete="off"
+                   autocapitalize="sentences" spellcheck="false">
+            <button id="send-text" class="primary" type="button">Send</button>
+        </div>
+        <div class="keys">
+            <button type="button" data-key="Enter">Enter</button>
+            <button type="button" data-key="Backspace">Backspace</button>
+            <button type="button" data-key="Tab">Tab</button>
+            <button type="button" data-key="Escape">Esc</button>
+            <button type="button" data-key="ArrowUp">&uarr;</button>
+            <button type="button" data-key="ArrowDown">&darr;</button>
+            <button type="button" data-key="ArrowLeft">&larr;</button>
+            <button type="button" data-key="ArrowRight">&rarr;</button>
+            <button type="button" data-key="Delete">Del</button>
+            <button type="button" data-key="Home">Home</button>
+            <button type="button" data-key="End">End</button>
+            <button type="button" data-key="PageUp">PgUp</button>
+            <button type="button" data-key="PageDown">PgDn</button>
+            <button type="button" data-key="Control">Ctrl</button>
+            <button type="button" data-key="Alt">Alt</button>
+            <button type="button" data-key="Shift">Shift</button>
+            <button type="button" data-key="Meta">Win</button>
+            <button type="button" data-key="F5">F5</button>
+            <button type="button" data-key="F11">F11</button>
+            <button id="close-keyboard" class="danger" type="button">Hide</button>
+        </div>
+    </div>
+
+    <div id="shortcuts" class="g4f-ui">
+        <div class="row tight">
+            <strong>Shortcuts</strong>
+            <span class="spacer"></span>
+            <button id="close-shortcuts" class="danger" type="button">Hide</button>
+        </div>
+        <div class="keys" id="shortcuts-list"></div>
+    </div>
+
+    <div id="toast" class="g4f-ui" role="status" aria-live="polite"></div>
+
+    <script src="g4f-controls.js"></script>
+</body>
+</html>

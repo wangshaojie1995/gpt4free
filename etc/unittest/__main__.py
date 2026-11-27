@@ -1,5 +1,9 @@
 import unittest
 
+import g4f.debug
+
+g4f.debug.version_check = False
+
 from .asyncio import *
 from .backend import *
 from .main import *
@@ -8,7 +12,36 @@ from .client import *
 from .image_client import *
 from .include import *
 from .retry_provider import *
+from .thinking import *
 from .web_search import *
 from .models import *
+from .mcp import *
+from .tool_support_provider import *
+from .config_provider import *
+from .test_gemini import *
+from .test_chatgpt import *
+from .test_openai_token_images import *
+# from .test_qwen_stream import *
+# from .test_qwen_auth import *
+# from .test_qwen_guest import *
+from .test_deepseek_chunk_log import *
+# from .test_deepseek_stream import *
+from .test_deepseek_upload import *
+from .test_auth_retry import *
+from .test_api_route import *
+try:
+    from .test_domain_router import *
+except ImportError:
+    pass
+try:
+    from .test_sandbox_apps import *
+except ImportError:
+    pass
+from .test_provider_routing import *
+from .test_lightpanda import *
+from .test_har import *
+from .test_langfuse_tracing import *
+from .test_google_search import *
+# from .test_cdp_parallel import *
 
 unittest.main()

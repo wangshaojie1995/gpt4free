@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=assistant-ui
+Comment=assistant-ui web chat UI (Next.js) — created by its CLI and backed by the g4f API
+Exec=xfce4-terminal --disable-server --maximize --hide-borders --hide-menubar --title="assistant-ui" --icon=g4f-sandbox-assistant-ui --command="/usr/local/bin/sandbox-cli assistant-ui"
+Icon=g4f-sandbox-assistant-ui
+Terminal=false
+Categories=X-G4F-Sandbox;X-G4F-ChatUI;
+Keywords=assistant-ui;assistant;ui;chat;react;nextjs;;
+StartupNotify=false
